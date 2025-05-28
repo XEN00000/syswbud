@@ -44,15 +44,20 @@ void setup() {
   Serial.begin(9600);
   Bluetooth.begin(9600);
 
-  esc1.attach(5);
-  esc2.attach(6);
-  esc3.attach(10);
-  esc4.attach(9);
+  esc1.attach(5); // prawy dol 
+  esc2.attach(6); //lewa gora 
+  esc3.attach(10); // prawa gora
+  esc4.attach(9); // lewa dol
 
   pinMode(ledPin, OUTPUT);
 
-  setAllMotors(minPower);
-  delay(3000);
+  // setAllMotors(minPower);
+  // delay(3000);
+  for (int i = 0; i < 50; i++) {
+    setAllMotors(minPower);
+    delay(20);  // 20ms – typowy czas dla sygnału PWM (50Hz)
+  }
+  delay(1000); 
 
   if (!mpu.begin()) {
     Serial.println("MPU6050 not found!");
@@ -126,13 +131,22 @@ void loop() {
         currentPower = flightMinPower;
         Serial.println("Power set to flightMinPower on D release");
       }
-    } else if (c == 'Q' || c == 'q') {
+   } else if (c == 'Q' || c == 'q') {
       // Disarm
       armed = false;
       powerChange = 0;
       currentPower = minPower;
       setAllMotors(minPower);
-      Serial.println("DISARMED");
+
+      // Reset PID
+      integralRoll = 0.0;
+      lastRoll = 0.0;
+      integralPitch = 0.0;
+      lastPitch = 0.0;
+      roll = 0.0;
+      pitch = 0.0;
+
+      Serial.println("DISARMED & PID reset");
     }
   }
 
@@ -184,7 +198,7 @@ void loop() {
   int powerRightBottom = constrain(currentPower - rollCorrection - pitchCorrection, flightMinPower, maxPower);
   int powerLeftTop     = constrain(currentPower + rollCorrection - pitchCorrection, flightMinPower, maxPower);
   int powerRightTop    = constrain(currentPower - rollCorrection + pitchCorrection, flightMinPower, maxPower);
-  int powerLeftBottom  = constrain(currentPower + rollCorrection + pitchCorrection+50, flightMinPower, maxPower);
+  int powerLeftBottom  = constrain(currentPower + rollCorrection + pitchCorrection, flightMinPower, maxPower);
 
   if (armed && (millis() - armTime < STARTUP_DURATION)) {
     // Startowe ustawienie mocy
@@ -195,6 +209,15 @@ void loop() {
     esc3.writeMicroseconds(powerRightTop);
     esc4.writeMicroseconds(powerLeftBottom);
   }
+    // Wysyłanie danych diagnostycznych
+  Serial.print("roll:"); Serial.print(roll);
+  Serial.print(", pitch:"); Serial.print(pitch);
+  Serial.print(", rollCorrection:"); Serial.print(rollCorrection);
+  Serial.print(", pitchCorrection:"); Serial.print(pitchCorrection);
+  Serial.print(", powerRB:"); Serial.print(powerRightBottom);
+  Serial.print(", powerLT:"); Serial.print(powerLeftTop);
+  Serial.print(", powerRT:"); Serial.print(powerRightTop);
+  Serial.print(", powerLB:"); Serial.println(powerLeftBottom);
 
   delay(15);
 }
