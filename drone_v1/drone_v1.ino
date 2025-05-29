@@ -14,6 +14,7 @@ const int flightMinPower = 1200;
 const int powetToStayInAir = 1650;
 int currentPower = minPower;
 
+bool holdPositionMode = false;  // nowa zmienna trybu utrzymania pozycji
 int powerChange = 0; // 1 = zwiększ moc, -1 = zmniejsz moc, 0 = stabilna
 int powerStep = 10;
 
@@ -31,11 +32,14 @@ float pitchOffset = 0.0;
 const float alpha = 0.98;
 
 // PID parametry dla roll
-float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8;
+// float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8;
+float Kp_roll = 2.5, Ki_roll = 0.05, Kd_roll = 0.3;
+
 float integralRoll = 0.0, lastRoll = 0.0;
 
 // PID parametry dla pitch
-float Kp_pitch = 5.0, Ki_pitch = 0.2, Kd_pitch = 0.8;
+// float Kp_pitch = 5.0, Ki_pitch = 0.2, Kd_pitch = 0.8;
+float Kp_pitch = 2.5, Ki_pitch = 0.05, Kd_pitch = 0.3;
 float integralPitch = 0.0, lastPitch = 0.0;
 
 unsigned long lastTime = 0;
@@ -104,37 +108,36 @@ void loop() {
     char c = Bluetooth.read();
 
     if (c == 'U') {
-      // Przytrzymanie przycisku zwiększania mocy
       powerChange = 1;
       if (!armed) {
         armed = true;
         armTime = millis();
         Serial.println("ARMED (U)");
       }
+      holdPositionMode = false;  // tryb utrzymania pozycji wyłączony podczas trzymania przycisku
     } else if (c == 'u') {
-      // Puszczenie przycisku zwiększania mocy
       powerChange = 0;
       if (armed) {
         currentPower = powetToStayInAir;
-        Serial.println("Power locked at 1750 on U release");
+        holdPositionMode = true;  // Włącz tryb utrzymania pozycji przy puszczeniu U
+        Serial.println("Power locked at 1750 on U release - holdPositionMode ON");
       }
     } else if (c == 'D') {
-      // Przytrzymanie przycisku zmniejszania mocy
       powerChange = -1;
       if (!armed) {
         armed = true;
         armTime = millis();
         Serial.println("ARMED (D)");
       }
+      holdPositionMode = false;  // tryb utrzymania pozycji wyłączony podczas trzymania przycisku
     } else if (c == 'd') {
-      // Puszczenie przycisku zmniejszania mocy
-     powerChange = 0;
+      powerChange = 0;
       if (armed) {
         currentPower = powetToStayInAir;
-        Serial.println("Power locked at 1750 on D release");
+        holdPositionMode = true;  // Włącz tryb utrzymania pozycji przy puszczeniu D
+        Serial.println("Power locked at 1750 on D release - holdPositionMode ON");
       }
-   } else if (c == 'Q' || c == 'q') {
-      // Disarm
+    } else if (c == 'Q' || c == 'q') {
       armed = false;
       powerChange = 0;
       currentPower = minPower;
@@ -148,6 +151,8 @@ void loop() {
       roll = 0.0;
       pitch = 0.0;
 
+      holdPositionMode = false;  // wyłącz tryb utrzymania pozycji
+
       Serial.println("DISARMED & PID reset");
     }
   }
@@ -155,10 +160,10 @@ void loop() {
   // Zmiana mocy jeśli uzbrojony
   if (armed) {
     if (powerChange == 1 && currentPower < maxPower) {
-    currentPower += powerStep;
-  } else if (powerChange == -1 && currentPower > minPower) {
-    currentPower -= powerStep;
-  }
+      currentPower += powerStep;
+    } else if (powerChange == -1 && currentPower > minPower) {
+      currentPower -= powerStep;
+    }
   } else {
     currentPower = minPower;
     setAllMotors(minPower);
@@ -203,7 +208,6 @@ void loop() {
   int powerLeftBottom  = constrain(currentPower + rollCorrection + pitchCorrection, flightMinPower, maxPower);
 
   if (armed && (millis() - armTime < STARTUP_DURATION)) {
-    // Startowe ustawienie mocy
     setAllMotors(currentPower);
   } else if (armed) {
     esc1.writeMicroseconds(powerRightBottom);
@@ -211,20 +215,21 @@ void loop() {
     esc3.writeMicroseconds(powerRightTop);
     esc4.writeMicroseconds(powerLeftBottom);
   }
-    // Wysyłanie danych diagnostycznych
-  Serial.print("roll:"); Serial.print(roll);
-  Serial.print(", pitch:"); Serial.print(pitch);
-  Serial.print(", rollCorrection:"); Serial.print(rollCorrection);
-  Serial.print(", pitchCorrection:"); Serial.print(pitchCorrection);
-  Serial.print(", powerRB:"); Serial.print(powerRightBottom);
-  Serial.print(", powerLT:"); Serial.print(powerLeftTop);
-  Serial.print(", powerRT:"); Serial.print(powerRightTop);
-  Serial.print(", powerLB:"); Serial.println(powerLeftBottom);
 
-  // delayMicroseconds(3000);  // lub całkiem usuń, jeśli wszystko działa stabilnie
+  // Logowanie tylko w trybie utrzymania pozycji
+  if (holdPositionMode) {
+    Serial.print("roll:"); Serial.print(roll);
+    Serial.print(", pitch:"); Serial.print(pitch);
+    Serial.print(", rollCorrection:"); Serial.print(rollCorrection);
+    Serial.print(", pitchCorrection:"); Serial.print(pitchCorrection);
+    Serial.print(", powerRB:"); Serial.print(powerRightBottom);
+    Serial.print(", powerLT:"); Serial.print(powerLeftTop);
+    Serial.print(", powerRT:"); Serial.print(powerRightTop);
+    Serial.print(", powerLB:"); Serial.println(powerLeftBottom);
+  }
+
   delay(15);
 }
-
 void setAllMotors(int pwm) {
   esc1.writeMicroseconds(pwm);
   esc2.writeMicroseconds(pwm);
