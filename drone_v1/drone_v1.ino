@@ -11,10 +11,10 @@ Servo esc1, esc2, esc3, esc4;
 const int minPower = 1000;
 const int maxPower = 1750;
 const int flightMinPower = 1200;
-const int powetToStayInAir = 1650;
+const int powetToStayInAir = 1650; // Zwiększona moc bazowa
 int currentPower = minPower;
 
-bool holdPositionMode = false;  // nowa zmienna trybu utrzymania pozycji
+bool holdPositionMode = false;
 int powerChange = 0; // 1 = zwiększ moc, -1 = zmniejsz moc, 0 = stabilna
 int powerStep = 10;
 
@@ -29,56 +29,65 @@ float pitch = 0.0;
 float rollOffset = 0.0;
 float pitchOffset = 0.0;
 
-const float alpha = 0.98;
+// Trim offsety do kompensacji mechanicznych niesymetrii
+float rollTrim = 5.0;  // Kompensacja drифtu w prawo (możesz dostosować)
+float pitchTrim = 0.0;
 
-// PID parametry dla roll
-// float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8;
-float Kp_roll = 2.5, Ki_roll = 0.05, Kd_roll = 0.3;
+const float alpha = 0.95; // Zwiększone filtrowanie
 
+// Poprawione parametry PID dla roll - bardziej konserwatywne
+float Kp_roll = 1.8, Ki_roll = 0.02, Kd_roll = 0.6;
 float integralRoll = 0.0, lastRoll = 0.0;
 
-// PID parametry dla pitch
-// float Kp_pitch = 5.0, Ki_pitch = 0.2, Kd_pitch = 0.8;
-float Kp_pitch = 2.5, Ki_pitch = 0.05, Kd_pitch = 0.3;
+// Poprawione parametry PID dla pitch - bardziej konserwatywne  
+float Kp_pitch = 1.8, Ki_pitch = 0.02, Kd_pitch = 0.6;
 float integralPitch = 0.0, lastPitch = 0.0;
+
+// Ograniczenia dla składników PID
+const float MAX_INTEGRAL = 50.0;
+const float MAX_CORRECTION = 250;
 
 unsigned long lastTime = 0;
 unsigned long armTime = 0;
-const unsigned long STARTUP_DURATION = 500;
+const unsigned long STARTUP_DURATION = 1000; // Wydłużony czas startu
 
 void setup() {
   Serial.begin(9600);
   Bluetooth.begin(9600);
 
   esc1.attach(5); // prawy dol 
-  esc2.attach(6); //lewa gora 
+  esc2.attach(6); // lewa gora 
   esc3.attach(10); // prawa gora
   esc4.attach(9); // lewa dol
 
   pinMode(ledPin, OUTPUT);
 
-  // setAllMotors(minPower);
-  // delay(3000);
-  for (int i = 0; i < 50; i++) {
+  // Inicjalizacja ESC - wydłużona i ulepszona
+  Serial.println("Inicjalizacja ESC...");
+  for (int i = 0; i < 100; i++) {
     setAllMotors(minPower);
-    delay(20);  // 20ms – typowy czas dla sygnału PWM (50Hz)
+    delay(20);
   }
-  delay(1000); 
+  delay(2000); 
 
   if (!mpu.begin()) {
-    Serial.println("MPU6050 not found!");
+    Serial.println("MPU6050 nie znaleziony!");
     while (1);
   }
 
   mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
   mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+  mpu.setFilterBandwidth(MPU6050_BAND_10_HZ); // Lepsze filtrowanie
 
-  // Kalibracja offsetów (średnia z 100 pomiarów)
-  const int calibrationSamples = 100;
+  // Ulepszona kalibracja offsetów
+  const int calibrationSamples = 200; // Więcej próbek
   float rollSum = 0.0;
   float pitchSum = 0.0;
-  Serial.println("Calibrating sensors...");
+  Serial.println("Kalibracja czujników... Upewnij się że dron jest poziomo!");
+  
+  // Odczekaj 2 sekundy przed kalibracją
+  delay(2000);
+  
   for (int i = 0; i < calibrationSamples; i++) {
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
@@ -89,8 +98,15 @@ void setup() {
     rollSum += roll_acc;
     pitchSum += pitch_acc;
 
+    if (i % 20 == 0) {
+      Serial.print("Kalibracja: ");
+      Serial.print((i * 100) / calibrationSamples);
+      Serial.println("%");
+    }
+
     delay(10);
   }
+  
   rollOffset = rollSum / calibrationSamples;
   pitchOffset = pitchSum / calibrationSamples;
 
@@ -98,12 +114,13 @@ void setup() {
   Serial.println(rollOffset);
   Serial.print("pitchOffset: ");
   Serial.println(pitchOffset);
+  Serial.println("Kalibracja zakończona!");
 
   lastTime = micros();
 }
 
 void loop() {
-  // Odczyt znaków z modułu Bluetooth
+  // Odczyt komend z Bluetooth
   while (Bluetooth.available()) {
     char c = Bluetooth.read();
 
@@ -112,66 +129,88 @@ void loop() {
       if (!armed) {
         armed = true;
         armTime = millis();
-        Serial.println("ARMED (U)");
+        resetPID(); // Reset PID przy uzbrójeniu
+        Serial.println("UZBROJONY (U)");
       }
-      holdPositionMode = false;  // tryb utrzymania pozycji wyłączony podczas trzymania przycisku
+      holdPositionMode = false;
     } else if (c == 'u') {
       powerChange = 0;
       if (armed) {
         currentPower = powetToStayInAir;
-        holdPositionMode = true;  // Włącz tryb utrzymania pozycji przy puszczeniu U
-        Serial.println("Power locked at 1750 on U release - holdPositionMode ON");
+        holdPositionMode = true;
+        Serial.println("Moc zablokowana na " + String(powetToStayInAir) + " - tryb utrzymania pozycji WŁĄCZONY");
       }
     } else if (c == 'D') {
       powerChange = -1;
       if (!armed) {
         armed = true;
         armTime = millis();
-        Serial.println("ARMED (D)");
+        resetPID(); // Reset PID przy uzbrójeniu
+        Serial.println("UZBROJONY (D)");
       }
-      holdPositionMode = false;  // tryb utrzymania pozycji wyłączony podczas trzymania przycisku
+      holdPositionMode = false;
     } else if (c == 'd') {
       powerChange = 0;
       if (armed) {
         currentPower = powetToStayInAir;
-        holdPositionMode = true;  // Włącz tryb utrzymania pozycji przy puszczeniu D
-        Serial.println("Power locked at 1750 on D release - holdPositionMode ON");
+        holdPositionMode = true;
+        Serial.println("Moc zablokowana na " + String(powetToStayInAir) + " - tryb utrzymania pozycji WŁĄCZONY");
       }
     } else if (c == 'Q' || c == 'q') {
-      armed = false;
-      powerChange = 0;
-      currentPower = minPower;
-      setAllMotors(minPower);
-
-      // Reset PID
-      integralRoll = 0.0;
-      lastRoll = 0.0;
-      integralPitch = 0.0;
-      lastPitch = 0.0;
-      roll = 0.0;
-      pitch = 0.0;
-
-      holdPositionMode = false;  // wyłącz tryb utrzymania pozycji
-
-      Serial.println("DISARMED & PID reset");
+      disarmDrone();
+    } else if (c == 'L') {
+      // Trim w lewo (zmniejsz rollTrim)
+      rollTrim -= 0.5;
+      Serial.println("Trim w lewo: " + String(rollTrim));
+    } else if (c == 'R') {
+      // Trim w prawo (zwiększ rollTrim)
+      rollTrim += 0.5;
+      Serial.println("Trim w prawo: " + String(rollTrim));
+    } else if (c == 'F') {
+      // Trim do przodu (zmniejsz pitchTrim)
+      pitchTrim -= 0.5;
+      Serial.println("Trim do przodu: " + String(pitchTrim));
+    } else if (c == 'B') {
+      // Trim do tyłu (zwiększ pitchTrim)
+      pitchTrim += 0.5;
+      Serial.println("Trim do tyłu: " + String(pitchTrim));
+    } else if (c == 'T') {
+      // Wyzeruj trim
+      rollTrim = 0.0;
+      pitchTrim = 0.0;
+      Serial.println("Trim wyzerowany");
     }
   }
 
-  // Zmiana mocy jeśli uzbrojony
+  // Kontrola mocy
   if (armed) {
     if (powerChange == 1 && currentPower < maxPower) {
       currentPower += powerStep;
-    } else if (powerChange == -1 && currentPower > minPower) {
+    } else if (powerChange == -1 && currentPower > flightMinPower) {
       currentPower -= powerStep;
+    }
+    
+    // Ograniczenie minimalnej mocy podczas lotu
+    if (currentPower < flightMinPower) {
+      currentPower = flightMinPower;
     }
   } else {
     currentPower = minPower;
     setAllMotors(minPower);
   }
 
+  // Kontrola LED
   digitalWrite(ledPin, (armed && currentPower > minPower) ? HIGH : LOW);
 
-  // Odczyt danych z MPU6050
+  // Odczyt z MPU6050 i obliczenia PID tylko gdy uzbrojony
+  if (armed) {
+    updateIMUAndPID();
+  }
+
+  delay(10); // Zmniejszony delay dla lepszej responsywności
+}
+
+void updateIMUAndPID() {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -179,60 +218,105 @@ void loop() {
   float dt = (now - lastTime) / 1000000.0;
   lastTime = now;
 
+  // Ograniczenie dt dla stabilności
+  if (dt > 0.1) dt = 0.1;
+
+  // Obliczenie kątów z akcelerometru
   float roll_acc = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
   float pitch_acc = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
 
+  // Integracja żyroskopu
   roll += g.gyro.x * 180.0 / PI * dt;
   pitch += g.gyro.y * 180.0 / PI * dt;
 
+  // Filtr komplementarny z poprawkami offsetu
   roll = alpha * roll + (1.0 - alpha) * (roll_acc - rollOffset);
   pitch = alpha * pitch + (1.0 - alpha) * (pitch_acc - pitchOffset);
 
-  // PID roll
-  integralRoll += roll * dt;
-  float derivativeRoll = (roll - lastRoll) / dt;
-  lastRoll = roll;
-  int rollCorrection = (int)(-(Kp_roll * roll + Ki_roll * integralRoll + Kd_roll * derivativeRoll));
-  rollCorrection = constrain(rollCorrection, -300, 300);
+  // Kontroler PID dla roll z trim
+  float rollError = roll - rollTrim;  // Zastosowanie trim
+  integralRoll += rollError * dt;
+  integralRoll = constrain(integralRoll, -MAX_INTEGRAL, MAX_INTEGRAL); // Ochrona przed integral windup
+  
+  float derivativeRoll = (rollError - lastRoll) / dt;
+  lastRoll = rollError;
+  
+  int rollCorrection = (int)(-(Kp_roll * rollError + Ki_roll * integralRoll + Kd_roll * derivativeRoll));
+  rollCorrection = constrain(rollCorrection, -MAX_CORRECTION, MAX_CORRECTION);
 
-  // PID pitch
-  integralPitch += pitch * dt;
-  float derivativePitch = (pitch - lastPitch) / dt;
-  lastPitch = pitch;
-  int pitchCorrection = (int)(Kp_pitch * pitch + Ki_pitch * integralPitch + Kd_pitch * derivativePitch);
-  pitchCorrection = constrain(pitchCorrection, -300, 300);
+  // Kontroler PID dla pitch z trim
+  float pitchError = pitch - pitchTrim;  // Zastosowanie trim
+  integralPitch += pitchError * dt;
+  integralPitch = constrain(integralPitch, -MAX_INTEGRAL, MAX_INTEGRAL); // Ochrona przed integral windup
+  
+  float derivativePitch = (pitchError - lastPitch) / dt;
+  lastPitch = pitchError;
+  
+  int pitchCorrection = (int)(Kp_pitch * pitchError + Ki_pitch * integralPitch + Kd_pitch * derivativePitch);
+  pitchCorrection = constrain(pitchCorrection, -MAX_CORRECTION, MAX_CORRECTION);
 
-  int powerRightBottom = constrain(currentPower - rollCorrection - pitchCorrection , flightMinPower, maxPower);
+  // Obliczenie mocy dla każdego silnika
+  int powerRightBottom = constrain(currentPower - rollCorrection - pitchCorrection, flightMinPower, maxPower);
   int powerLeftTop     = constrain(currentPower + rollCorrection - pitchCorrection, flightMinPower, maxPower);
   int powerRightTop    = constrain(currentPower - rollCorrection + pitchCorrection, flightMinPower, maxPower);
   int powerLeftBottom  = constrain(currentPower + rollCorrection + pitchCorrection, flightMinPower, maxPower);
 
-  if (armed && (millis() - armTime < STARTUP_DURATION)) {
+  // Stopniowe uruchamianie - pierwszą sekundę jednakowa moc na wszystkie silniki
+  if (millis() - armTime < STARTUP_DURATION) {
     setAllMotors(currentPower);
-  } else if (armed) {
+    Serial.println("Rozruch - moc: " + String(currentPower));
+  } else {
+    // Normalne działanie z PID
     esc1.writeMicroseconds(powerRightBottom);
     esc2.writeMicroseconds(powerLeftTop);
     esc3.writeMicroseconds(powerRightTop);
     esc4.writeMicroseconds(powerLeftBottom);
   }
 
-  // Logowanie tylko w trybie utrzymania pozycji
-  if (holdPositionMode) {
-    Serial.print("roll:"); Serial.print(roll);
-    Serial.print(", pitch:"); Serial.print(pitch);
-    Serial.print(", rollCorrection:"); Serial.print(rollCorrection);
-    Serial.print(", pitchCorrection:"); Serial.print(pitchCorrection);
-    Serial.print(", powerRB:"); Serial.print(powerRightBottom);
-    Serial.print(", powerLT:"); Serial.print(powerLeftTop);
-    Serial.print(", powerRT:"); Serial.print(powerRightTop);
-    Serial.print(", powerLB:"); Serial.println(powerLeftBottom);
+  // Logowanie w trybie utrzymania pozycji (zmniejszona częstotliwość)
+  static unsigned long lastLogTime = 0;
+  if (holdPositionMode && (millis() - lastLogTime > 100)) { // Log co 100ms
+    lastLogTime = millis();
+    Serial.print("R:"); Serial.print(roll, 1);
+    Serial.print(", P:"); Serial.print(pitch, 1);
+    Serial.print(", RC:"); Serial.print(rollCorrection);
+    Serial.print(", PC:"); Serial.print(pitchCorrection);
+    Serial.print(", PWR[RB:"); Serial.print(powerRightBottom);
+    Serial.print(", LT:"); Serial.print(powerLeftTop);
+    Serial.print(", RT:"); Serial.print(powerRightTop);
+    Serial.print(", LB:"); Serial.print(powerLeftBottom);
+    Serial.println("]");
+    
+    // Dodatkowe ostrzeżenia
+    if (abs(roll) > 20 || abs(pitch) > 20) {
+      Serial.println("UWAGA: Duże odchylenie kątowe!");
+    }
   }
-
-  delay(15);
 }
+
 void setAllMotors(int pwm) {
   esc1.writeMicroseconds(pwm);
   esc2.writeMicroseconds(pwm);
   esc3.writeMicroseconds(pwm);
   esc4.writeMicroseconds(pwm);
+}
+
+void resetPID() {
+  integralRoll = 0.0;
+  lastRoll = 0.0;
+  integralPitch = 0.0;
+  lastPitch = 0.0;
+  roll = 0.0;
+  pitch = 0.0;
+  Serial.println("PID zresetowany");
+}
+
+void disarmDrone() {
+  armed = false;
+  powerChange = 0;
+  currentPower = minPower;
+  setAllMotors(minPower);
+  resetPID();
+  holdPositionMode = false;
+  Serial.println("ROZBROJONY - wszystkie systemy zresetowane");
 }
