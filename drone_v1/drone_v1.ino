@@ -11,9 +11,11 @@ Servo esc1, esc2, esc3, esc4;
 const int minPower = 1000;
 const int maxPower = 1750;
 const int flightMinPower = 1200;
+const int powetToStayInAir = 1650;
 int currentPower = minPower;
 
 int powerChange = 0; // 1 = zwiększ moc, -1 = zmniejsz moc, 0 = stabilna
+int powerStep = 10;
 
 bool armed = false;
 
@@ -38,7 +40,7 @@ float integralPitch = 0.0, lastPitch = 0.0;
 
 unsigned long lastTime = 0;
 unsigned long armTime = 0;
-const unsigned long STARTUP_DURATION = 2000;
+const unsigned long STARTUP_DURATION = 500;
 
 void setup() {
   Serial.begin(9600);
@@ -112,9 +114,9 @@ void loop() {
     } else if (c == 'u') {
       // Puszczenie przycisku zwiększania mocy
       powerChange = 0;
-      if (armed && currentPower < flightMinPower) {
-        currentPower = flightMinPower;
-        Serial.println("Power set to flightMinPower on U release");
+      if (armed) {
+        currentPower = powetToStayInAir;
+        Serial.println("Power locked at 1750 on U release");
       }
     } else if (c == 'D') {
       // Przytrzymanie przycisku zmniejszania mocy
@@ -126,10 +128,10 @@ void loop() {
       }
     } else if (c == 'd') {
       // Puszczenie przycisku zmniejszania mocy
-      powerChange = 0;
-      if (armed && currentPower < flightMinPower) {
-        currentPower = flightMinPower;
-        Serial.println("Power set to flightMinPower on D release");
+     powerChange = 0;
+      if (armed) {
+        currentPower = powetToStayInAir;
+        Serial.println("Power locked at 1750 on D release");
       }
    } else if (c == 'Q' || c == 'q') {
       // Disarm
@@ -153,10 +155,10 @@ void loop() {
   // Zmiana mocy jeśli uzbrojony
   if (armed) {
     if (powerChange == 1 && currentPower < maxPower) {
-      currentPower += 2; // zwiększ moc
-    } else if (powerChange == -1 && currentPower > minPower) {
-      currentPower -= 2; // zmniejsz moc
-    }
+    currentPower += powerStep;
+  } else if (powerChange == -1 && currentPower > minPower) {
+    currentPower -= powerStep;
+  }
   } else {
     currentPower = minPower;
     setAllMotors(minPower);
@@ -195,7 +197,7 @@ void loop() {
   int pitchCorrection = (int)(Kp_pitch * pitch + Ki_pitch * integralPitch + Kd_pitch * derivativePitch);
   pitchCorrection = constrain(pitchCorrection, -300, 300);
 
-  int powerRightBottom = constrain(currentPower - rollCorrection - pitchCorrection, flightMinPower, maxPower);
+  int powerRightBottom = constrain(currentPower - rollCorrection - pitchCorrection , flightMinPower, maxPower);
   int powerLeftTop     = constrain(currentPower + rollCorrection - pitchCorrection, flightMinPower, maxPower);
   int powerRightTop    = constrain(currentPower - rollCorrection + pitchCorrection, flightMinPower, maxPower);
   int powerLeftBottom  = constrain(currentPower + rollCorrection + pitchCorrection, flightMinPower, maxPower);
@@ -219,6 +221,7 @@ void loop() {
   Serial.print(", powerRT:"); Serial.print(powerRightTop);
   Serial.print(", powerLB:"); Serial.println(powerLeftBottom);
 
+  // delayMicroseconds(3000);  // lub całkiem usuń, jeśli wszystko działa stabilnie
   delay(15);
 }
 
