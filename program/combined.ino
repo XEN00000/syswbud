@@ -1,6 +1,5 @@
-#include <Wire.h>          // Wymagane do komunikacji I2C z MPU6050
-#include <Adafruit_MPU6050.h> // Biblioteka dla czujnika IMU MPU6050
-#include <Adafruit_Sensor.h> // Podstawowa biblioteka czujników dla czujników Adafruit
+#include <Wire.h>          // Wymagane do komunikacji I2C
+#include <MPU6050_light.h> // Biblioteka dla czujnika IMU MPU6050
 #include <Servo.h>         // Biblioteka do sterowania ESC (Electronic Speed Controllers)
 #include <SoftwareSerial.h> // Biblioteka do programowej komunikacji szeregowej (np. moduł Bluetooth)
 
@@ -25,14 +24,14 @@ const int FLIGHT_MIN_POWER = 1200;  // Minimalna moc dla stabilnego lotu (silnik
 const int STABLE_FLIGHT_POWER = 1650; // Docelowa moc dla stabilnego zawisu (można dostosować)
 
 // PID (Proportional-Integral-Derivative) Stałe Kontrolera dla Trybu Lotu
-const float ALPHA = 0.98;           // Współczynnik filtra komplementarnego (do fuzji danych IMU)
-const float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8; // Stałe PID dla osi Roll (przechyłu bocznego)
-const float Kp_pitch = 5.0, Ki_pitch = 0.2, Kd_pitch = 0.8; // Stałe PID dla osi Pitch (przechyłu przód-tył)
+const float MPU_FILTER_ALPHA = 0.98; // Współczynnik filtra komplementarnego dla MPU6050_light (jeśli używany ręcznie)
+const float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8; // Stałe PID dla osi Roll
+const float Kp_pitch = 5.0, Ki_pitch = 0.2, Kd_pitch = 0.8; // Stałe PID dla osi Pitch
 
 // Stałe Trybu Demonstracji Akcelerometru
-const int DEMO_BASE_POWER = 1100;    // Podstawowa moc dla silników w trybie demo (nieco powyżej MIN_POWER)
-const float DEMO_TILT_THRESHOLD = 15.0; // Stopnie przechylenia, które wywołują redukcję mocy w trybie demo
-const int DEMO_REDUCTION_AMOUNT = 100; // Kwota redukcji mocy w trybie demo po przechyleniu
+const int DEMO_BASE_POWER = 1150;    // Podstawowa moc dla silników w trybie demo (jak w Twoim przykładzie)
+const float DEMO_KP_ROLL = 15.0;     // Współczynnik P dla roll w trybie demo
+const float DEMO_KP_PITCH = 15.0;    // Współczynnik P dla pitch w trybie demo (odwrócony znak)
 
 // Uruchamianie i Uzbrajanie
 const unsigned long STARTUP_DURATION = 500; // Czas trwania po uzbrojeniu przed pełnym sterowaniem PID
@@ -40,16 +39,16 @@ const unsigned long STARTUP_DURATION = 500; // Czas trwania po uzbrojeniu przed 
 // === ZMIENNE GLOBALNE ===
 SoftwareSerial Bluetooth(RX_PIN, TX_PIN); // Obiekt SoftwareSerial do komunikacji Bluetooth
 Servo esc1, esc2, esc3, esc4;             // Obiekty Servo do sterowania ESC
-Adafruit_MPU6050 mpu;                     // Obiekt czujnika MPU6050
+MPU6050 mpu(Wire);                        // Obiekt czujnika MPU6050
 
 // Zmienne sterowania lotem
 int currentPower = MIN_POWER; // Aktualny poziom gazu dla wszystkich silników
 int powerChange = 0;          // -1 dla zmniejszenia, 0 dla braku zmiany, 1 dla zwiększenia
 int powerStep = 10;           // Krok zwiększania/zmniejszania gazu
-bool armed = false;           // Prawda, jeśli silniki są uzbrojone i gotowe do lotu
+bool armed = false;           // Prawda, jeśli silniki są uzbrojone i gotowe do lotu (tylko dla FLIGHT_MODE)
+bool demo_motors_active = false; // Prawda, jeśli silniki są aktywne w trybie demo
 
 // Zmienne stanu IMU i PID
-float rollOffset = 0.0, pitchOffset = 0.0; // Offsety kalibracyjne dla IMU
 float roll = 0.0, pitch = 0.0;             // Aktualne kąty roll i pitch (stopnie)
 float integralRoll = 0.0, lastRoll = 0.0;  // Całka i poprzedni błąd dla PID Roll
 float integralPitch = 0.0, lastPitch = 0.0; // Całka i poprzedni błąd dla PID Pitch
@@ -65,19 +64,20 @@ int currentOperatingMode = ACCEL_DEMO_MODE; // Domyślny tryb po uruchomieniu
 // === DEKLARACJE FUNKCJI ===
 void initializeESCs();
 void calibrateIMU();
-void readIMU(float &rollOut, float &pitchOut, sensors_event_t &a, sensors_event_t &g, float dt);
+void readIMU(float &rollOut, float &pitchOut, float dt);
 int computePIDRoll(float rollValue, float dt);
 int computePIDPitch(float pitchValue, float dt);
-void applyMotorPower(int rollCorr, int pitchCorr); // Teraz przyjmuje korekcje i stosuje w zależności od trybu
+void applyMotorPower(int rollCorr, int pitchCorr);
 void resetPID();
 void handleBluetoothCommand(char c);
 void setAllMotors(int pwm);
-void switchMode(int newMode); // Nowa funkcja do obsługi przełączania trybów
+void switchMode(int newMode);
+void disarmMotors(); // Funkcja do rozbrajania silników
 
 // === SETUP ===
 void setup() {
   Serial.begin(9600);     // Inicjalizacja komunikacji szeregowej do debugowania
-  Bluetooth.begin(9600);  // Inicjalizacja programowej komunikacji szeregowej dla modułu Bluetooth
+  Bluetooth.begin(9900);  // Inicjalizacja programowej komunikacji szeregowej dla modułu Bluetooth (Upewnij się, że ta prędkość jest zgodna z Twoim modułem BT)
   pinMode(LED_PIN, OUTPUT); // Ustaw pin LED jako wyjście
 
   // Podłącz ESC do odpowiednich pinów serwo
@@ -92,13 +92,15 @@ void setup() {
   // Inicjalizacja i kalibracja czujnika MPU6050
   calibrateIMU();
 
-  lastTime = micros(); // Zapisz aktualny czas do obliczania dt w pętli
+  lastTime = micros();
 
   Serial.println("System drona gotowy!");
   Serial.print("Aktualny tryb: ");
   Serial.println(currentOperatingMode == FLIGHT_MODE ? "FLIGHT_MODE" : "ACCEL_DEMO_MODE");
   Serial.println("Wyślij 'F' dla Trybu Lotu, 'A' dla Trybu Demonstracji Akcelerometru.");
-  Serial.println("W Trybie Lotu: 'U' aby zwiększyć moc, 'D' aby zmniejszyć moc, 'Q' aby rozbroić.");
+  Serial.println("W Trybie Lotu: 'U' aby zwiększyć moc, 'u' aby zablokować moc (lub zmniejszać), 'D' aby zmniejszyć moc, 'd' aby zablokować moc (lub zwiększać).");
+  Serial.println("W Trybie Demonstracji Akcelerometru: 'U' aby WŁĄCZYĆ silniki, 'D' aby WYŁĄCZYĆ silniki.");
+  Serial.println("Wyślij 'Q' aby rozbroić silniki (działa w obu trybach).");
 }
 
 // === GŁÓWNA PĘTLA ===
@@ -109,42 +111,34 @@ void loop() {
     handleBluetoothCommand(c);
   }
 
-  // Zaktualizuj currentPower w zależności od stanu uzbrojenia i poleceń gazu
-  if (currentOperatingMode == FLIGHT_MODE) {
-    if (armed) {
-      if (powerChange == 1 && currentPower < MAX_POWER) currentPower += powerStep;
-      else if (powerChange == -1 && currentPower > MIN_POWER) currentPower -= powerStep;
-    } else {
-      currentPower = MIN_POWER; // Jeśli rozbrojony, silniki są na minimalnej mocy
-      setAllMotors(MIN_POWER);
-    }
-  } else { // ACCEL_DEMO_MODE
-    currentPower = DEMO_BASE_POWER; // W trybie demo moc jest stała
-  }
-
-
   // Kontroluj diodę LED w zależności od stanu uzbrojenia i aktywności silników
-  digitalWrite(LED_PIN, (armed && currentPower > MIN_POWER) ? HIGH : LOW);
-
-  // Pobierz nowe zdarzenia z czujnika MPU6050
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  digitalWrite(LED_PIN, (armed && currentPower > MIN_POWER) || (currentOperatingMode == ACCEL_DEMO_MODE && demo_motors_active) ? HIGH : LOW);
 
   // Oblicz czas, który upłynął od ostatniej iteracji pętli (dt)
   unsigned long now = micros();
   float dt = (now - lastTime) / 1e6; // dt w sekundach
   lastTime = now;
 
-  // Odczytaj i połącz dane IMU, aby uzyskać aktualne kąty roll i pitch
-  readIMU(roll, pitch, a, g, dt);
+  // Odczytaj i zaktualizuj kąty roll i pitch z MPU6050_light
+  readIMU(roll, pitch, dt);
 
   int rollCorrection = 0;
   int pitchCorrection = 0;
 
   // Oblicz korekcje PID tylko w Trybie Lotu
   if (currentOperatingMode == FLIGHT_MODE) {
+    // Zaktualizuj currentPower w zależności od stanu uzbrojenia i poleceń gazu
+    if (armed) {
+      if (powerChange == 1 && currentPower < MAX_POWER) currentPower += powerStep;
+      else if (powerChange == -1 && currentPower > MIN_POWER) currentPower -= powerStep;
+    } else {
+      currentPower = MIN_POWER;
+      setAllMotors(MIN_POWER);
+    }
     rollCorrection = computePIDRoll(roll, dt);
     pitchCorrection = computePIDPitch(pitch, dt);
+  } else { // ACCEL_DEMO_MODE
+    currentPower = DEMO_BASE_POWER; // W trybie demo moc bazowa jest stała
   }
 
   // Zastosuj moc silników w zależności od aktualnego trybu i korekcji
@@ -157,10 +151,17 @@ void loop() {
   if (currentOperatingMode == FLIGHT_MODE) {
     Serial.print(", Korekcja Roll:"); Serial.print(rollCorrection);
     Serial.print(", Korekcja Pitch:"); Serial.print(pitchCorrection);
+    Serial.print(", Moc:"); Serial.println(currentPower);
+  } else { // ACCEL_DEMO_MODE
+    Serial.print(", Demo Active: "); Serial.print(demo_motors_active ? "TAK" : "NIE");
+    // W trybie demo wyświetlamy aktualne moce silników, aby zobaczyć reakcję na przechylenie
+    Serial.print(", ESC1:"); Serial.print(esc1.readMicroseconds());
+    Serial.print(", ESC2:"); Serial.print(esc2.readMicroseconds());
+    Serial.print(", ESC3:"); Serial.print(esc3.readMicroseconds());
+    Serial.print(", ESC4:"); Serial.println(esc4.readMicroseconds());
   }
-  Serial.print(", Moc:"); Serial.println(currentPower);
-
-  delay(15); // Małe opóźnienie, aby umożliwić stabilne odczyty czujników i wykonanie pętli
+  
+  delay(15); // Opóźnienie jak w oryginalnym kodzie
 }
 
 // === FUNKCJE POMOCNICZE ===
@@ -177,77 +178,44 @@ void initializeESCs() {
 }
 
 /**
- * @brief Kalibruje czujnik MPU6050 poprzez odczytanie początkowych wartości akcelerometru
- * w celu określenia offsetów poziomu dla roll i pitch.
+ * @brief Kalibruje czujnik MPU6050_light.
+ * Ta funkcja używa wbudowanych metod kalibracji MPU6050_light.
  */
 void calibrateIMU() {
   Serial.println("Inicjalizacja MPU6050...");
-  if (!mpu.begin()) {
-    Serial.println("MPU6050 nie znaleziono! Sprawdź okablowanie.");
-    while (1) delay(10); // Zatrzymaj wykonanie, jeśli MPU6050 nie zostanie wykryty
+  Wire.begin(); // Rozpocznij komunikację I2C
+  byte status = mpu.begin();
+  if (status != 0) { // 0 = wszystko ok!
+    Serial.print("MPU6050 nie znaleziono! Błąd statusu: ");
+    Serial.println(status);
+    while (1) delay(10); // Zatrzymaj wykonanie
   }
   Serial.println("MPU6050 podłączony.");
 
-  // Skonfiguruj ustawienia MPU6050
-  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ); // Ustaw cyfrowy filtr dolnoprzepustowy
-
-  const int samples = 100; // Liczba próbek do kalibracji
-  float rollSum = 0.0, pitchSum = 0.0;
-  Serial.println("Kalibracja czujników... Trzymaj drona nieruchomo.");
-
-  // Zbierz próbki, aby obliczyć średnie offsety
-  for (int i = 0; i < samples; i++) {
-    sensors_event_t a, g, temp;
-    mpu.getEvent(&a, &g, &temp); // Pobierz nowe dane z czujnika
-
-    // Oblicz roll i pitch z danych akcelerometru (w stopniach)
-    float roll_acc = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
-    float pitch_acc = atan2(-a.acceleration.x, sqrt(pow(a.acceleration.y, 2) + pow(a.acceleration.z, 2))) * 180.0 / PI;
-
-    rollSum += roll_acc;
-    pitchSum += pitch_acc;
-
-    delay(10); // Małe opóźnienie między próbkami
-  }
-
-  // Oblicz średnie offsety
-  rollOffset = rollSum / samples;
-  pitchOffset = pitchSum / samples;
-
-  Serial.print("Kalibracja zakończona. Offset Roll: "); Serial.print(rollOffset, 2);
-  Serial.print(", Offset Pitch: "); Serial.println(pitchOffset, 2);
+  // MPU6050_light domyślnie wykonuje pewne ustawienia i offsety przy pierwszym uruchomieniu.
+  // Jeśli potrzebujesz ręcznej kalibracji (np. zerowania offsetów),
+  // możesz użyć mpu.calcOffsets(true, true); z włączonymi akcelerometrem i żyroskopem.
+  // Należy umieścić drona w pozycji poziomej podczas kalibracji.
+  Serial.println("Kalibracja MPU6050... Trzymaj drona nieruchomo.");
+  mpu.calcOffsets(true, true); // Kalibracja akcelerometru i żyroskopu (trujące true)
+  Serial.println("Kalibracja zakończona.");
 }
 
 /**
- * @brief Odczytuje surowe dane IMU i stosuje filtr komplementarny do oszacowania
- * dokładnych kątów roll i pitch.
- * @param rollOut Referencja do przechowywania obliczonego kąta roll.
- * @param pitchOut Referencja do przechowywania obliczonego kąta pitch.
- * @param a Dane zdarzenia akcelerometru.
- * @param g Dane zdarzenia żyroskopu.
+ * @brief Odczytuje dane z MPU6050_light i aktualizuje kąty roll i pitch.
+ * MPU6050_light wewnętrznie stosuje filtr komplementarny.
+ * @param rollOut Referencja do globalnej zmiennej roll.
+ * @param pitchOut Referencja do globalnej zmiennej pitch.
  * @param dt Czas, który upłynął od ostatniego odczytu w sekundach.
  */
-void readIMU(float &rollOut, float &pitchOut, sensors_event_t &a, sensors_event_t &g, float dt) {
-  // Oblicz roll i pitch z akcelerometru (statyczne odniesienie)
-  float roll_acc = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
-  float pitch_acc = atan2(-a.acceleration.x, sqrt(pow(a.acceleration.y, 2) + pow(a.acceleration.z, 2))) * 180.0 / PI;
-
-  // Zintegruj dane żyroskopu, aby uzyskać zmianę kąta (dynamiczne odniesienie)
-  // Wartości żyroskopu są w rad/s, przekonwertuj na deg/s i pomnóż przez dt
-  roll += g.gyro.x * 180.0 / PI * dt;
-  pitch += g.gyro.y * 180.0 / PI * dt;
-
-  // Zastosuj filtr komplementarny:
-  // Żyroskop zapewnia szybką, krótkoterminową dokładność. Akcelerometr zapewnia wolną, długoterminową dokładność.
-  rollOut = ALPHA * roll + (1 - ALPHA) * (roll_acc - rollOffset);
-  pitchOut = ALPHA * pitch + (1 - ALPHA) * (pitch_acc - pitchOffset);
-
-  // Zaktualizuj globalne zmienne roll i pitch przefiltrowanymi wartościami
-  roll = rollOut;
-  pitch = pitchOut;
+void readIMU(float &rollOut, float &pitchOut, float dt) {
+  mpu.update(); // Pobierz nowe dane i zaktualizuj wewnętrzne kąty
+  
+  // MPU6050_light używa getAngleX() i getAngleY() do zwracania kątów roll i pitch.
+  rollOut = mpu.getAngleX();
+  pitchOut = mpu.getAngleY();
 }
+
 
 /**
  * @brief Oblicza korekcję PID dla osi roll.
@@ -289,69 +257,71 @@ int computePIDPitch(float pitchValue, float dt) {
 
 /**
  * @brief Stosuje obliczoną moc silników w zależności od aktualnego trybu działania.
- * W FLIGHT_MODE używa korekcji PID. W ACCEL_DEMO_MODE reaguje na przechylenie.
+ * W FLIGHT_MODE używa korekcji PID. W ACCEL_DEMO_MODE reaguje na przechylenie,
+ * aktywując silniki na "najniższej" stronie (lub stronach).
  * @param rollCorr Korekcja PID dla roll (używana w FLIGHT_MODE).
  * @param pitchCorr Korekcja PID dla pitch (używana w FLIGHT_MODE).
  */
 void applyMotorPower(int rollCorr, int pitchCorr) {
   if (currentOperatingMode == FLIGHT_MODE) {
     if (armed && (millis() - armTime < STARTUP_DURATION)) {
-      // Podczas początkowej fazy uruchamiania, uruchom wszystkie silniki z currentPower
       setAllMotors(currentPower);
     } else if (armed) {
-      // Zastosuj korekcje PID do poszczególnych silników
       // Mapowanie silników dla konfiguracji 'X':
-      // esc1 (Tylny Prawy)
-      // esc2 (Przedni Lewy)
-      // esc3 (Przedni Prawy)
-      // esc4 (Tylny Lewy)
+      // ESC1 (Tylny Prawy) - pin 5
+      // ESC2 (Przedni Lewy) - pin 6
+      // ESC3 (Przedni Prawy) - pin 10
+      // ESC4 (Tylny Lewy) - pin 9
 
-      // Dostosuj moc w zależności od korekcji roll i pitch
-      // Korekcja roll: zmniejsz moc prawych silników, zwiększ moc lewych silników (dla pozytywnego roll)
-      // Korekcja pitch: zmniejsz moc przednich silników, zwiększ moc tylnych silników (dla pozytywnego pitch)
-      esc1.writeMicroseconds(constrain(currentPower - rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER)); // Tylny Prawy
-      esc2.writeMicroseconds(constrain(currentPower + rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER)); // Przedni Lewy
-      esc3.writeMicroseconds(constrain(currentPower - rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER)); // Przedni Prawy
-      esc4.writeMicroseconds(constrain(currentPower + rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER)); // Tylny Lewy
+      // Moc silników z korekcją
+      int powerRightTop    = constrain(currentPower - rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC3 (pin 10)
+      int powerRightBottom = constrain(currentPower - rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC1 (pin 5)
+      int powerLeftTop     = constrain(currentPower + rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC2 (pin 6)
+      int powerLeftBottom  = constrain(currentPower + rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC4 (pin 9)
+
+      esc1.writeMicroseconds(powerRightBottom); // Tylny Prawy (pin 5)
+      esc2.writeMicroseconds(powerLeftTop);     // Przedni Lewy (pin 6)
+      esc3.writeMicroseconds(powerRightTop);    // Przedni Prawy (pin 10)
+      esc4.writeMicroseconds(powerLeftBottom);  // Tylny Lewy (pin 9)
     } else {
-      // Jeśli nie uzbrojony, upewnij się, że wszystkie silniki są na minimalnej mocy
       setAllMotors(MIN_POWER);
     }
   } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
-    // W Trybie Demonstracji Akcelerometru, silniki pracują z podstawową mocą i reagują na przechylenie
-    int power1 = DEMO_BASE_POWER; // Tylny Prawy
-    int power2 = DEMO_BASE_POWER; // Przedni Lewy
-    int power3 = DEMO_BASE_POWER; // Przedni Prawy
-    int power4 = DEMO_BASE_POWER; // Tylny Lewy
+    if (demo_motors_active) {
+      // W Trybie Demonstracji Akcelerometru, silniki reagują na przechylenie
+      // Moc jest modyfikowana w zależności od kąta przechylenia.
+      // Używamy Kp z trybu demo.
 
-    // Zastosuj redukcję mocy w zależności od przechylenia roll
-    if (roll > DEMO_TILT_THRESHOLD) { // Przechylony w prawo
-      // Zmniejsz moc prawych silników (Tylny Prawy, Przedni Prawy)
-      power1 = constrain(power1 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-      power3 = constrain(power3 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-    } else if (roll < -DEMO_TILT_THRESHOLD) { // Przechylony w lewo
-      // Zmniejsz moc lewych silników (Przedni Lewy, Tylny Lewy)
-      power2 = constrain(power2 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-      power4 = constrain(power4 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
+      // Obliczamy "korekcję" podobnie jak w PID, ale tylko z członem proporcjonalnym
+      // i z osobnymi stałymi dla trybu demo.
+      // Ważne: znaki korekcji są odwrócone, bo chcemy, aby silniki z "niższej" strony zwiększały moc.
+      // W trybie lotu PID zmniejsza moc silnika, który jest "za wysoko".
+      // W trybie demo chcemy, aby silnik z "niższej" strony ZWIĘKSZAŁ moc.
+      int demoRollCorrection = (int)(DEMO_KP_ROLL * roll);
+      int demoPitchCorrection = (int)(DEMO_KP_PITCH * pitch); // Odwrócony znak dla pitch, aby zachować logikę "dolnej strony"
+
+      // Zastosuj moc do każdego silnika, gdzie bazowa moc to DEMO_BASE_POWER
+      // Wartość power jest zwiększana, gdy silnik znajduje się na "niższej" stronie.
+      // constrain zapewnia, że moc mieści się w dopuszczalnym zakresie (MIN_POWER do MAX_POWER)
+      
+      // ESC1 (Tylny Prawy) - pin 5: moc zwiększa się, gdy roll jest dodatni (prawa strona w dół) i pitch jest ujemny (tył w dół)
+      int power1 = constrain(DEMO_BASE_POWER + demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
+      // ESC2 (Przedni Lewy) - pin 6: moc zwiększa się, gdy roll jest ujemny (lewa strona w dół) i pitch jest dodatni (przód w dół)
+      int power2 = constrain(DEMO_BASE_POWER - demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
+      // ESC3 (Przedni Prawy) - pin 10: moc zwiększa się, gdy roll jest dodatni (prawa strona w dół) i pitch jest dodatni (przód w dół)
+      int power3 = constrain(DEMO_BASE_POWER + demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
+      // ESC4 (Tylny Lewy) - pin 9: moc zwiększa się, gdy roll jest ujemny (lewa strona w dół) i pitch jest ujemny (tył w dół)
+      int power4 = constrain(DEMO_BASE_POWER - demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
+
+      // Zastosuj obliczoną moc do każdego silnika
+      esc1.writeMicroseconds(power1); // Tylny Prawy (pin 5)
+      esc2.writeMicroseconds(power2); // Przedni Lewy (pin 6)
+      esc3.writeMicroseconds(power3); // Przedni Prawy (pin 10)
+      esc4.writeMicroseconds(power4); // Tylny Lewy (pin 9)
+    } else {
+      // Jeśli demo_motors_active jest false, wyłącz wszystkie silniki w trybie demo
+      setAllMotors(MIN_POWER);
     }
-
-    // Zastosuj redukcję mocy w zależności od przechylenia pitch
-    if (pitch > DEMO_TILT_THRESHOLD) { // Przechylony do przodu
-      // Zmniejsz moc przednich silników (Przedni Lewy, Przedni Prawy)
-      // Uwaga: Ponownie ograniczamy, więc jeśli roll już to zmniejszył, nie spadnie poniżej MIN_POWER
-      power2 = constrain(power2 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-      power3 = constrain(power3 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-    } else if (pitch < -DEMO_TILT_THRESHOLD) { // Przechylony do tyłu
-      // Zmniejsz moc tylnych silników (Tylny Prawy, Tylny Lewy)
-      power1 = constrain(power1 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-      power4 = constrain(power4 - DEMO_REDUCTION_AMOUNT, MIN_POWER, DEMO_BASE_POWER);
-    }
-
-    // Zastosuj obliczoną moc do każdego silnika
-    esc1.writeMicroseconds(power1);
-    esc2.writeMicroseconds(power2);
-    esc3.writeMicroseconds(power3);
-    esc4.writeMicroseconds(power4);
   }
 }
 
@@ -364,10 +334,24 @@ void resetPID() {
   lastRoll = 0.0;
   integralPitch = 0.0;
   lastPitch = 0.0;
+  // Kąty roll i pitch są resetowane poprzez ponowną kalibrację MPU
   roll = 0.0;
   pitch = 0.0;
-  // Ponownie skalibruj IMU, aby uzyskać świeże offsety dla aktualnej orientacji
-  calibrateIMU();
+  calibrateIMU(); // Ponownie skalibruj IMU, aby uzyskać świeże zerowe odniesienie
+}
+
+/**
+ * @brief Rozbraja silniki, ustawia moc na MIN_POWER i resetuje PID.
+ * Używana dla awaryjnego zatrzymania.
+ */
+void disarmMotors() {
+  armed = false;
+  demo_motors_active = false; // Rozbrajamy też tryb demo
+  powerChange = 0;
+  currentPower = MIN_POWER;
+  setAllMotors(MIN_POWER); // Upewnij się, że silniki się zatrzymały
+  resetPID(); // Zresetuj stan PID i skalibruj IMU
+  Serial.println("SILNIKI ROZBROJONE I ZRESETOWANY PID (Awaryjne zatrzymanie)");
 }
 
 /**
@@ -375,6 +359,12 @@ void resetPID() {
  * @param c Znak odebrany z Bluetooth.
  */
 void handleBluetoothCommand(char c) {
+  // Awaryjne rozbrojenie działa w obu trybach
+  if (c == 'Q' || c == 'q') {
+    disarmMotors();
+    return; // Zakończ funkcję po rozbrojeniu
+  }
+
   if (c == 'F') { // Przełącz na Tryb Lotu
     switchMode(FLIGHT_MODE);
   } else if (c == 'A') { // Przełącz na Tryb Demonstracji Akcelerometru
@@ -383,39 +373,36 @@ void handleBluetoothCommand(char c) {
     // Przetwarzaj polecenia sterowania lotem tylko w FLIGHT_MODE
     if (c == 'U') { // Zwiększ gaz
       powerChange = 1;
+      // Ustawienie armed na true tylko przy pierwszym naciśnięciu 'U' lub 'D'
       if (!armed) {
         armed = true;
         armTime = millis(); // Zapisz czas uzbrojenia
         Serial.println("UZBROJONY (U)");
       }
-    } else if (c == 'u') { // Przestań zwiększać gaz, zablokuj moc
-      powerChange = 0;
-      if (armed) {
-        // Opcjonalnie, zablokuj moc na STABLE_FLIGHT_POWER lub aktualnym poziomie
-        // currentPower = STABLE_FLIGHT_POWER;
-        Serial.println("Moc zablokowana po zwolnieniu U");
-      }
+    } else if (c == 'u') { // Przestań zwiększać gaz (lub pozwól na zmniejszanie)
+      powerChange = 0; // Zablokuj zmianę mocy, pozostawiając ją na aktualnym poziomie lub pozwalając na spadek
+      Serial.println("Moc zablokowana po zwolnieniu U");
     } else if (c == 'D') { // Zmniejsz gaz
       powerChange = -1;
+      // Ustawienie armed na true tylko przy pierwszym naciśnięciu 'U' lub 'D'
       if (!armed) {
         armed = true;
         armTime = millis(); // Zapisz czas uzbrojenia
         Serial.println("UZBROJONY (D)");
       }
-    } else if (c == 'd') { // Przestań zmniejszać gaz, zablokuj moc
-      powerChange = 0;
-      if (armed) {
-        // Opcjonalnie, zablokuj moc na STABLE_FLIGHT_POWER lub aktualnym poziomie
-        // currentPower = STABLE_FLIGHT_POWER;
-        Serial.println("Moc zablokowana po zwolnieniu D");
-      }
-    } else if (c == 'Q' || c == 'q') { // Rozbrój silniki
-      armed = false;
-      powerChange = 0;
-      currentPower = MIN_POWER;
-      setAllMotors(MIN_POWER); // Upewnij się, że silniki się zatrzymały
-      resetPID(); // Zresetuj stan PID
-      Serial.println("ROZBROJONY i zresetowany PID");
+    } else if (c == 'd') { // Przestań zmniejszać gaz (lub pozwól na zwiększanie)
+      powerChange = 0; // Zablokuj zmianę mocy, pozostawiając ją na aktualnym poziomie lub pozwalając na wzrost
+      Serial.println("Moc zablokowana po zwolnieniu D");
+    }
+  } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
+    // Polecenia dla trybu demonstracyjnego
+    if (c == 'U' || c == 'u') {
+      demo_motors_active = true;
+      Serial.println("Tryb Demo: Silniki WŁĄCZONE (przycisk U)");
+    } else if (c == 'D' || c == 'd') {
+      demo_motors_active = false;
+      setAllMotors(MIN_POWER); // Upewnij się, że silniki są wyłączone natychmiast
+      Serial.println("Tryb Demo: Silniki WYŁĄCZONE (przycisk D)");
     }
   } else {
     Serial.print("Nieznane polecenie lub polecenie nieprawidłowe w bieżącym trybie: ");
@@ -442,12 +429,7 @@ void setAllMotors(int pwm) {
 void switchMode(int newMode) {
   if (currentOperatingMode != newMode) {
     currentOperatingMode = newMode;
-    armed = false; // Zawsze rozbrajaj podczas przełączania trybów
-    powerChange = 0;
-    currentPower = MIN_POWER;
-    setAllMotors(MIN_POWER); // Upewnij się, że silniki są wyłączone
-    resetPID(); // Zresetuj PID i ponownie skalibruj IMU dla nowego trybu
-
+    disarmMotors(); // Zawsze rozbrajaj podczas przełączania trybów dla bezpieczeństwa
     Serial.print("Przełączono na ");
     Serial.println(newMode == FLIGHT_MODE ? "FLIGHT_MODE" : "ACCEL_DEMO_MODE");
   } else {
