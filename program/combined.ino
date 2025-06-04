@@ -1,13 +1,15 @@
 #include <Wire.h>          // Wymagane do komunikacji I2C
 #include <MPU6050_light.h> // Biblioteka dla czujnika IMU MPU6050
 #include <Servo.h>         // Biblioteka do sterowania ESC (Electronic Speed Controllers)
-#include <SoftwareSerial.h> // Biblioteka do programowej komunikacji szeregowej (np. moduł Bluetooth)
+// #include <SoftwareSerial.h> // Usunięta - używamy HardwareSerial (Serial)
 
 // === KONFIGURACJA ===
 // Definicje pinów
-const int RX_PIN = 2; // Pin RX modułu Bluetooth (łączy się z TX Arduino)
-const int TX_PIN = 3; // Pin TX modułu Bluetooth (łączy się z RX Arduino)
-const int LED_PIN = 8; // Pin diody LED
+// Komunikacja Bluetooth będzie teraz używać sprzętowego UART na pinach 0 (RX) i 1 (TX).
+// Pamiętaj o dzielnikach napięcia dla HC-05 TX -> Arduino RX (Pin 0) i HC-05 RX -> Arduino TX (Pin 1)!
+const int LED_PIN = 8;       // Pin diody LED (dla wizualizacji stanu)
+const int BT_STATE_PIN = 2;  // Pin STATE z HC-05 podłączony do pinu 2 Arduino (dla przerwania zewnętrznego INT0).
+                             // Pamiętaj o dzielniku napięcia dla HC-05 STATE -> Arduino Pin 2!
 
 // Przypisania pinów ESC (dostosuj w zależności od układu silników drona)
 // Te komentarze opisują fizyczne położenie silników na dronie
@@ -19,17 +21,15 @@ const int ESC4_PIN = 9;  // Tylny Lewy (lewa dol)
 
 // Ustawienia Mocy Silników (w mikrosekundach, dla ESC)
 const int MIN_POWER = 1000;         // Minimalny sygnał do ESC (silniki wyłączone/jałowe)
-const int MAX_POWER = 1750;         // Maksymalny sygnał do ESC (pełny gaz)
+const int MAX_POWER = 1350;         // Maksymalny sygnał do ESC (pełny gaz)
 const int FLIGHT_MIN_POWER = 1200;  // Minimalna moc dla stabilnego lotu (silniki się kręcą)
-const int STABLE_FLIGHT_POWER = 1650; // Docelowa moc dla stabilnego zawisu (można dostosować)
 
 // PID (Proportional-Integral-Derivative) Stałe Kontrolera dla Trybu Lotu
-const float MPU_FILTER_ALPHA = 0.98; // Współczynnik filtra komplementarnego dla MPU6050_light (jeśli używany ręcznie)
-const float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8; // Stałe PID dla osi Roll
+const float Kp_roll = 5.0, Ki_roll = 0.2, Kd_roll = 0.8;   // Stałe PID dla osi Roll
 const float Kp_pitch = 5.0, Ki_pitch = 0.2, Kd_pitch = 0.8; // Stałe PID dla osi Pitch
 
 // Stałe Trybu Demonstracji Akcelerometru
-const int DEMO_BASE_POWER = 1150;    // Podstawowa moc dla silników w trybie demo (jak w Twoim przykładzie)
+const int DEMO_BASE_POWER = 1150;    // Podstawowa moc dla silników w trybie demo
 const float DEMO_KP_ROLL = 15.0;     // Współczynnik P dla roll w trybie demo
 const float DEMO_KP_PITCH = 15.0;    // Współczynnik P dla pitch w trybie demo (odwrócony znak)
 
@@ -37,7 +37,7 @@ const float DEMO_KP_PITCH = 15.0;    // Współczynnik P dla pitch w trybie demo
 const unsigned long STARTUP_DURATION = 500; // Czas trwania po uzbrojeniu przed pełnym sterowaniem PID
 
 // === ZMIENNE GLOBALNE ===
-SoftwareSerial Bluetooth(RX_PIN, TX_PIN); // Obiekt SoftwareSerial do komunikacji Bluetooth
+// Usunięto: SoftwareSerial Bluetooth(RX_PIN, TX_PIN); - używamy wbudowanego obiektu Serial
 Servo esc1, esc2, esc3, esc4;             // Obiekty Servo do sterowania ESC
 MPU6050 mpu(Wire);                        // Obiekt czujnika MPU6050
 
@@ -56,6 +56,10 @@ float integralPitch = 0.0, lastPitch = 0.0; // Całka i poprzedni błąd dla PID
 unsigned long lastTime = 0; // Znacznik czasu ostatniej iteracji pętli (do obliczania dt)
 unsigned long armTime = 0;  // Znacznik czasu uzbrojenia drona
 
+// Zmienne dla funkcji Fail-Safe (bezpieczne lądowanie) z IRQ
+volatile boolean bluetooth_connected_ISR = false; // Aktualny stan połączenia Bluetooth (zmienna dla ISR)
+const int LANDING_POWER_DECREASE_STEP = 5; // Krok zmniejszania mocy podczas lądowania awaryjnego
+
 // Tryby Działania
 #define FLIGHT_MODE 0       // Normalny tryb lotu ze stabilizacją PID
 #define ACCEL_DEMO_MODE 1   // Tryb demonstracji akcelerometru
@@ -73,12 +77,38 @@ void handleBluetoothCommand(char c);
 void setAllMotors(int pwm);
 void switchMode(int newMode);
 void disarmMotors(); // Funkcja do rozbrajania silników
+void initiateFailSafeLanding(); // Funkcja do inicjowania bezpiecznego lądowania
+
+// === FUNKCJA OBSŁUGI PRZERWANIA (ISR) ===
+// Ta funkcja jest wywoływana automatycznie, gdy stan na BT_STATE_PIN (pin 2) się zmienia.
+void bluetoothStateChange() {
+  bluetooth_connected_ISR = digitalRead(BT_STATE_PIN) == HIGH; // Odczytaj nowy stan
+  // Używamy tylko dla debugowania podczas rozwoju.
+  if (bluetooth_connected_ISR) {
+    // Serial.println(F("ISR: BLUETOOTH: Ponownie połączono!"));
+  } else {
+    // Serial.println(F("ISR: BLUETOOTH: Utracono połączenie!"));
+  }
+}
 
 // === SETUP ===
 void setup() {
-  Serial.begin(9600);     // Inicjalizacja komunikacji szeregowej do debugowania
-  Bluetooth.begin(9900);  // Inicjalizacja programowej komunikacji szeregowej dla modułu Bluetooth (Upewnij się, że ta prędkość jest zgodna z Twoim modułem BT)
-  pinMode(LED_PIN, OUTPUT); // Ustaw pin LED jako wyjście
+  // Inicjalizacja sprzętowego UART (Serial) dla komunikacji z komputerem (debugowanie)
+  // i jednocześnie dla modułu Bluetooth.
+  // Pamiętaj, że port jest współdzielony!
+  Serial.begin(9600); // Standardowa prędkość dla debugowania na monitorze szeregowym
+  
+  // Ustawienie prędkości dla modułu Bluetooth.
+  // UWAGA: Upewnij się, że Twój moduł HC-05 jest skonfigurowany na tę samą prędkość (np. 9600, 19200, 38400).
+  // Prędkość 9900 jest bardzo nietypowa i prawdopodobnie będziesz musiał ją zmienić.
+  Serial.begin(9900); // Prędkość komunikacji z modułem HC-05
+
+  pinMode(LED_PIN, OUTPUT);     // Ustaw pin LED jako wyjście
+  pinMode(BT_STATE_PIN, INPUT); // Ustaw pin BT_STATE jako wejście
+
+  // Konfiguracja przerwania zewnętrznego dla pinu BT_STATE_PIN (pin 2)
+  // Przerwanie będzie wyzwolone przy każdej zmianie stanu (CHANGE) pinu.
+  attachInterrupt(digitalPinToInterrupt(BT_STATE_PIN), bluetoothStateChange, CHANGE);
 
   // Podłącz ESC do odpowiednich pinów serwo
   esc1.attach(ESC1_PIN);
@@ -94,326 +124,265 @@ void setup() {
 
   lastTime = micros();
 
-  Serial.println("System drona gotowy!");
-  Serial.print("Aktualny tryb: ");
-  Serial.println(currentOperatingMode == FLIGHT_MODE ? "FLIGHT_MODE" : "ACCEL_DEMO_MODE");
-  Serial.println("Wyślij 'F' dla Trybu Lotu, 'A' dla Trybu Demonstracji Akcelerometru.");
-  Serial.println("W Trybie Lotu: 'U' aby zwiększyć moc, 'u' aby zablokować moc (lub zmniejszać), 'D' aby zmniejszyć moc, 'd' aby zablokować moc (lub zwiększać).");
-  Serial.println("W Trybie Demonstracji Akcelerometru: 'U' aby WŁĄCZYĆ silniki, 'D' aby WYŁĄCZYĆ silniki.");
-  Serial.println("Wyślij 'Q' aby rozbroić silniki (działa w obu trybach).");
+  Serial.println(F("System drona gotowy!"));
+  Serial.print(F("Aktualny tryb: "));
+  Serial.println(currentOperatingMode == FLIGHT_MODE ? F("FLIGHT_MODE") : F("ACCEL_DEMO_MODE"));
+  Serial.println(F("Wyślij 'F' dla Trybu Lotu, 'A' dla Trybu Demonstracji Akcelerometru."));
+  Serial.println(F("W Trybie Lotu: 'U' aby zwiększyć moc, 'u' aby zablokować moc (lub zmniejszać), 'D' aby zmniejszyć moc, 'd' aby zablokować moc (lub zwiększać)."));
+  Serial.println(F("W Trybie Demonstracji Akcelerometru: 'U' aby WŁĄCZYĆ silniki, 'D' aby WYŁĄCZYĆ silniki."));
+  Serial.println(F("Wyślij 'Q' aby rozbroić silniki (działa w obu trybach)."));
+  Serial.println(F("Pin STATE HC-05 podłączony do pinu 2 Arduino (przerwanie INT0)."));
+  Serial.println(F("Komunikacja Bluetooth przez sprzętowy UART (piny 0 i 1)."));
+  
+  // Początkowy odczyt stanu BT_STATE_PIN
+  bluetooth_connected_ISR = digitalRead(BT_STATE_PIN) == HIGH;
+  Serial.print(F("Początkowy stan Bluetooth: "));
+  Serial.println(bluetooth_connected_ISR ? F("POŁĄCZONO") : F("ROZŁĄCZONO"));
 }
 
 // === GŁÓWNA PĘTLA ===
 void loop() {
-  // Sprawdź przychodzące polecenia Bluetooth
-  while (Bluetooth.available()) {
-    char c = Bluetooth.read();
+  // Odczytaj dane z modułu Bluetooth za pomocą sprzętowego UART (obiekt Serial)
+  while (Serial.available()) {
+    char c = Serial.read();
     handleBluetoothCommand(c);
   }
 
-  // Kontroluj diodę LED w zależności od stanu uzbrojenia i aktywności silników
-  digitalWrite(LED_PIN, (armed && currentPower > MIN_POWER) || (currentOperatingMode == ACCEL_DEMO_MODE && demo_motors_active) ? HIGH : LOW);
+  // Odczytaj stan połączenia Bluetooth ze zmiennej volatile
+  noInterrupts(); // Wyłącz przerwania na krótki czas, aby bezpiecznie odczytać zmienną volatile
+  bool current_bt_state = bluetooth_connected_ISR; // Skopiuj wartość do zmiennej lokalnej
+  interrupts(); // Włącz przerwania z powrotem
 
+  // NOWA KONTROLA DIODY LED: Świeci tylko w trybie FLIGHT_MODE
+  digitalWrite(LED_PIN, currentOperatingMode == FLIGHT_MODE ? HIGH : LOW);
+
+  // Jeśli połączenie Bluetooth zostało utracone, zainicjuj bezpieczne lądowanie
+  if (currentOperatingMode == FLIGHT_MODE && armed && !current_bt_state) {
+    initiateFailSafeLanding();
+  }
+  
   // Oblicz czas, który upłynął od ostatniej iteracji pętli (dt)
   unsigned long now = micros();
   float dt = (now - lastTime) / 1e6; // dt w sekundach
   lastTime = now;
 
   // Odczytaj i zaktualizuj kąty roll i pitch z MPU6050_light
-  readIMU(roll, pitch, dt);
+  mpu.update(); // Zaktualizuj dane IMU
+
+  roll = mpu.getAngleX();
+  pitch = mpu.getAngleY();
 
   int rollCorrection = 0;
   int pitchCorrection = 0;
 
-  // Oblicz korekcje PID tylko w Trybie Lotu
-  if (currentOperatingMode == FLIGHT_MODE) {
-    // Zaktualizuj currentPower w zależności od stanu uzbrojenia i poleceń gazu
-    if (armed) {
-      if (powerChange == 1 && currentPower < MAX_POWER) currentPower += powerStep;
-      else if (powerChange == -1 && currentPower > MIN_POWER) currentPower -= powerStep;
-    } else {
-      currentPower = MIN_POWER;
-      setAllMotors(MIN_POWER);
-    }
+  // Oblicz korekcje PID tylko w Trybie Lotu, jeśli jest uzbrojony i połączony
+  if (currentOperatingMode == FLIGHT_MODE && armed && current_bt_state) {
+    if (powerChange == 1 && currentPower < MAX_POWER) currentPower += powerStep;
+    else if (powerChange == -1 && currentPower > MIN_POWER) currentPower -= powerStep;
+    
     rollCorrection = computePIDRoll(roll, dt);
     pitchCorrection = computePIDPitch(pitch, dt);
-  } else { // ACCEL_DEMO_MODE
+  } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
     currentPower = DEMO_BASE_POWER; // W trybie demo moc bazowa jest stała
+  } else {
+    // Jeśli nie jesteśmy w trybie lotu i uzbrojeni, lub nie jesteśmy połączeni,
+    // silniki powinny być na minimum (albo w stanie lądowania awaryjnego)
+    setAllMotors(currentPower);
   }
 
   // Zastosuj moc silników w zależności od aktualnego trybu i korekcji
   applyMotorPower(rollCorrection, pitchCorrection);
 
   // Wyjście debugowania do Monitora Szeregowego
-  Serial.print("Tryb: "); Serial.print(currentOperatingMode == FLIGHT_MODE ? "F" : "A");
-  Serial.print(", Roll:"); Serial.print(roll, 2);
-  Serial.print(", Pitch:"); Serial.print(pitch, 2);
+  // Pamiętaj, że te komunikaty będą widoczne TYLKO, gdy moduł Bluetooth jest odłączony
+  // i Arduino jest podłączone do komputera przez USB.
+  Serial.print(F("Tryb: ")); Serial.print(currentOperatingMode == FLIGHT_MODE ? F("F") : F("A"));
+  Serial.print(F(", Roll:")); Serial.print(roll, 2);
+  Serial.print(F(", Pitch:")); Serial.print(pitch, 2);
   if (currentOperatingMode == FLIGHT_MODE) {
-    Serial.print(", Korekcja Roll:"); Serial.print(rollCorrection);
-    Serial.print(", Korekcja Pitch:"); Serial.print(pitchCorrection);
-    Serial.print(", Moc:"); Serial.println(currentPower);
+    Serial.print(F(", Korekcja Roll:")); Serial.print(rollCorrection);
+    Serial.print(F(", Korekcja Pitch:")); Serial.print(pitchCorrection);
+    Serial.print(F(", Moc:")); Serial.print(currentPower);
+    Serial.print(F(", BT Connected: ")); Serial.println(current_bt_state ? F("TAK") : F("NIE"));
   } else { // ACCEL_DEMO_MODE
-    Serial.print(", Demo Active: "); Serial.print(demo_motors_active ? "TAK" : "NIE");
-    // W trybie demo wyświetlamy aktualne moce silników, aby zobaczyć reakcję na przechylenie
-    Serial.print(", ESC1:"); Serial.print(esc1.readMicroseconds());
-    Serial.print(", ESC2:"); Serial.print(esc2.readMicroseconds());
-    Serial.print(", ESC3:"); Serial.print(esc3.readMicroseconds());
-    Serial.print(", ESC4:"); Serial.println(esc4.readMicroseconds());
+    Serial.print(F(", Demo Active: ")); Serial.print(demo_motors_active ? F("TAK") : F("NIE"));
+    Serial.print(F(", ESC1:")); Serial.print(esc1.readMicroseconds());
+    Serial.print(F(", ESC2:")); Serial.print(esc2.readMicroseconds());
+    Serial.print(F(", ESC3:")); Serial.print(esc3.readMicroseconds());
+    Serial.print(F(", ESC4:")); Serial.println(esc4.readMicroseconds());
   }
   
-  delay(15); // Opóźnienie jak w oryginalnym kodzie
+  delay(15);
 }
 
 // === FUNKCJE POMOCNICZE ===
 
-/**
- * @brief Inicjalizuje ESC poprzez wysłanie niskiego sygnału na krótki czas.
- * Jest to często wymagane do sekwencji kalibracji/uzbrajania ESC.
- */
 void initializeESCs() {
-  Serial.println("Inicjalizacja ESC...");
-  setAllMotors(MIN_POWER); // Upewnij się, że wszystkie silniki są na minimalnej mocy
-  delay(3000); // Poczekaj, aż ESC się uzbroją (niektóre ESC potrzebują dłuższego opóźnienia)
-  Serial.println("ESCs zainicjalizowane.");
+  Serial.println(F("Inicjalizacja ESC..."));
+  setAllMotors(MIN_POWER);
+  delay(3000);
+  Serial.println(F("ESCs zainicjalizowane."));
 }
 
-/**
- * @brief Kalibruje czujnik MPU6050_light.
- * Ta funkcja używa wbudowanych metod kalibracji MPU6050_light.
- */
 void calibrateIMU() {
-  Serial.println("Inicjalizacja MPU6050...");
-  Wire.begin(); // Rozpocznij komunikację I2C
+  Serial.println(F("Inicjalizacja MPU6050..."));
+  Wire.begin();
   byte status = mpu.begin();
-  if (status != 0) { // 0 = wszystko ok!
-    Serial.print("MPU6050 nie znaleziono! Błąd statusu: ");
+  if (status != 0) {
+    Serial.print(F("MPU6050 nie znaleziono! Błąd statusu: "));
     Serial.println(status);
-    while (1) delay(10); // Zatrzymaj wykonanie
+    while (1) delay(10);
   }
-  Serial.println("MPU6050 podłączony.");
-
-  // MPU6050_light domyślnie wykonuje pewne ustawienia i offsety przy pierwszym uruchomieniu.
-  // Jeśli potrzebujesz ręcznej kalibracji (np. zerowania offsetów),
-  // możesz użyć mpu.calcOffsets(true, true); z włączonymi akcelerometrem i żyroskopem.
-  // Należy umieścić drona w pozycji poziomej podczas kalibracji.
-  Serial.println("Kalibracja MPU6050... Trzymaj drona nieruchomo.");
-  mpu.calcOffsets(true, true); // Kalibracja akcelerometru i żyroskopu (trujące true)
-  Serial.println("Kalibracja zakończona.");
+  Serial.println(F("MPU6050 podłączony."));
+  Serial.println(F("Kalibracja MPU6050... Trzymaj drona nieruchomo."));
+  mpu.calcOffsets(true, true);
+  Serial.println(F("Kalibracja zakończona."));
 }
 
-/**
- * @brief Odczytuje dane z MPU6050_light i aktualizuje kąty roll i pitch.
- * MPU6050_light wewnętrznie stosuje filtr komplementarny.
- * @param rollOut Referencja do globalnej zmiennej roll.
- * @param pitchOut Referencja do globalnej zmiennej pitch.
- * @param dt Czas, który upłynął od ostatniego odczytu w sekundach.
- */
 void readIMU(float &rollOut, float &pitchOut, float dt) {
-  mpu.update(); // Pobierz nowe dane i zaktualizuj wewnętrzne kąty
-  
-  // MPU6050_light używa getAngleX() i getAngleY() do zwracania kątów roll i pitch.
+  // mpu.update() jest wywoływane bezpośrednio w loop()
   rollOut = mpu.getAngleX();
   pitchOut = mpu.getAngleY();
 }
 
-
-/**
- * @brief Oblicza korekcję PID dla osi roll.
- * @param rollValue Aktualny kąt roll.
- * @param dt Czas, który upłynął od ostatniego obliczenia w sekundach.
- * @return Wartość korekcji PID dla roll.
- */
 int computePIDRoll(float rollValue, float dt) {
-  integralRoll += rollValue * dt; // Skumuluj błąd całkowy
-  // Ogranicz narastanie całki, aby zapobiec dużym przeregulowaniom
+  integralRoll += rollValue * dt;
   integralRoll = constrain(integralRoll, -200, 200);
 
-  float derivative = (rollValue - lastRoll) / dt; // Oblicz błąd różniczkowy
-  lastRoll = rollValue; // Zapisz aktualny roll do obliczeń różniczkowych w następnej iteracji
+  float derivative = (rollValue - lastRoll) / dt;
+  lastRoll = rollValue;
 
-  // Oblicz wyjście PID i ogranicz je w bezpiecznym zakresie
-  // Znak ujemny, ponieważ pozytywny roll wymaga ujemnej korekcji dla prawych silników
   return constrain(-(Kp_roll * rollValue + Ki_roll * integralRoll + Kd_roll * derivative), -300, 300);
 }
 
-/**
- * @brief Oblicza korekcję PID dla osi pitch.
- * @param pitchValue Aktualny kąt pitch.
- * @param dt Czas, który upłynął od ostatniego obliczenia w sekundach.
- * @return Wartość korekcji PID dla pitch.
- */
 int computePIDPitch(float pitchValue, float dt) {
-  integralPitch += pitchValue * dt; // Skumuluj błąd całkowy
-  // Ogranicz narastanie całki
+  integralPitch += pitchValue * dt;
   integralPitch = constrain(integralPitch, -200, 200);
 
-  float derivative = (pitchValue - lastPitch) / dt; // Oblicz błąd różniczkowy
-  lastPitch = pitchValue; // Zapisz aktualny pitch do obliczeń różniczkowych w następnej iteracji
+  float derivative = (pitchValue - lastPitch) / dt;
+  lastPitch = pitchValue;
 
-  // Oblicz wyjście PID i ogranicz je w bezpiecznym zakresie
-  // Znak dodatni, ponieważ pozytywny pitch wymaga dodatniej korekcji dla tylnych silników
   return constrain(Kp_pitch * pitchValue + Ki_pitch * integralPitch + Kd_pitch * derivative, -300, 300);
 }
 
-/**
- * @brief Stosuje obliczoną moc silników w zależności od aktualnego trybu działania.
- * W FLIGHT_MODE używa korekcji PID. W ACCEL_DEMO_MODE reaguje na przechylenie,
- * aktywując silniki na "najniższej" stronie (lub stronach).
- * @param rollCorr Korekcja PID dla roll (używana w FLIGHT_MODE).
- * @param pitchCorr Korekcja PID dla pitch (używana w FLIGHT_MODE).
- */
 void applyMotorPower(int rollCorr, int pitchCorr) {
+  noInterrupts();
+  bool current_bt_state_local = bluetooth_connected_ISR;
+  interrupts();
+
   if (currentOperatingMode == FLIGHT_MODE) {
-    if (armed && (millis() - armTime < STARTUP_DURATION)) {
-      setAllMotors(currentPower);
-    } else if (armed) {
-      // Mapowanie silników dla konfiguracji 'X':
-      // ESC1 (Tylny Prawy) - pin 5
-      // ESC2 (Przedni Lewy) - pin 6
-      // ESC3 (Przedni Prawy) - pin 10
-      // ESC4 (Tylny Lewy) - pin 9
+    if (armed && current_bt_state_local) {
+      if (millis() - armTime < STARTUP_DURATION) {
+        setAllMotors(currentPower);
+      } else {
+        int powerRightTop    = constrain(currentPower - rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER);
+        int powerRightBottom = constrain(currentPower - rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER);
+        int powerLeftTop     = constrain(currentPower + rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER);
+        int powerLeftBottom  = constrain(currentPower + rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER);
 
-      // Moc silników z korekcją
-      int powerRightTop    = constrain(currentPower - rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC3 (pin 10)
-      int powerRightBottom = constrain(currentPower - rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC1 (pin 5)
-      int powerLeftTop     = constrain(currentPower + rollCorr - pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC2 (pin 6)
-      int powerLeftBottom  = constrain(currentPower + rollCorr + pitchCorr, FLIGHT_MIN_POWER, MAX_POWER); // ESC4 (pin 9)
-
-      esc1.writeMicroseconds(powerRightBottom); // Tylny Prawy (pin 5)
-      esc2.writeMicroseconds(powerLeftTop);     // Przedni Lewy (pin 6)
-      esc3.writeMicroseconds(powerRightTop);    // Przedni Prawy (pin 10)
-      esc4.writeMicroseconds(powerLeftBottom);  // Tylny Lewy (pin 9)
+        esc1.writeMicroseconds(powerRightBottom);
+        esc2.writeMicroseconds(powerLeftTop);
+        esc3.writeMicroseconds(powerRightTop);
+        esc4.writeMicroseconds(powerLeftBottom);
+      }
     } else {
-      setAllMotors(MIN_POWER);
+      setAllMotors(currentPower);
     }
   } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
     if (demo_motors_active) {
-      // W Trybie Demonstracji Akcelerometru, silniki reagują na przechylenie
-      // Moc jest modyfikowana w zależności od kąta przechylenia.
-      // Używamy Kp z trybu demo.
-
-      // Obliczamy "korekcję" podobnie jak w PID, ale tylko z członem proporcjonalnym
-      // i z osobnymi stałymi dla trybu demo.
-      // Ważne: znaki korekcji są odwrócone, bo chcemy, aby silniki z "niższej" strony zwiększały moc.
-      // W trybie lotu PID zmniejsza moc silnika, który jest "za wysoko".
-      // W trybie demo chcemy, aby silnik z "niższej" strony ZWIĘKSZAŁ moc.
       int demoRollCorrection = (int)(DEMO_KP_ROLL * roll);
-      int demoPitchCorrection = (int)(DEMO_KP_PITCH * pitch); // Odwrócony znak dla pitch, aby zachować logikę "dolnej strony"
+      int demoPitchCorrection = (int)(DEMO_KP_PITCH * pitch);
 
-      // Zastosuj moc do każdego silnika, gdzie bazowa moc to DEMO_BASE_POWER
-      // Wartość power jest zwiększana, gdy silnik znajduje się na "niższej" stronie.
-      // constrain zapewnia, że moc mieści się w dopuszczalnym zakresie (MIN_POWER do MAX_POWER)
-      
-      // ESC1 (Tylny Prawy) - pin 5: moc zwiększa się, gdy roll jest dodatni (prawa strona w dół) i pitch jest ujemny (tył w dół)
       int power1 = constrain(DEMO_BASE_POWER + demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
-      // ESC2 (Przedni Lewy) - pin 6: moc zwiększa się, gdy roll jest ujemny (lewa strona w dół) i pitch jest dodatni (przód w dół)
       int power2 = constrain(DEMO_BASE_POWER - demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
-      // ESC3 (Przedni Prawy) - pin 10: moc zwiększa się, gdy roll jest dodatni (prawa strona w dół) i pitch jest dodatni (przód w dół)
       int power3 = constrain(DEMO_BASE_POWER + demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
-      // ESC4 (Tylny Lewy) - pin 9: moc zwiększa się, gdy roll jest ujemny (lewa strona w dół) i pitch jest ujemny (tył w dół)
       int power4 = constrain(DEMO_BASE_POWER - demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
 
-      // Zastosuj obliczoną moc do każdego silnika
-      esc1.writeMicroseconds(power1); // Tylny Prawy (pin 5)
-      esc2.writeMicroseconds(power2); // Przedni Lewy (pin 6)
-      esc3.writeMicroseconds(power3); // Przedni Prawy (pin 10)
-      esc4.writeMicroseconds(power4); // Tylny Lewy (pin 9)
+      esc1.writeMicroseconds(power1);
+      esc2.writeMicroseconds(power2);
+      esc3.writeMicroseconds(power3);
+      esc4.writeMicroseconds(power4);
     } else {
-      // Jeśli demo_motors_active jest false, wyłącz wszystkie silniki w trybie demo
       setAllMotors(MIN_POWER);
     }
   }
 }
 
-/**
- * @brief Resetuje człony całkowe i różniczkowe PID oraz oszacowania kątów.
- * Wywoływane podczas rozbrajania lub przełączania trybów, aby zapewnić czysty start.
- */
 void resetPID() {
   integralRoll = 0.0;
   lastRoll = 0.0;
   integralPitch = 0.0;
   lastPitch = 0.0;
-  // Kąty roll i pitch są resetowane poprzez ponowną kalibrację MPU
   roll = 0.0;
   pitch = 0.0;
-  calibrateIMU(); // Ponownie skalibruj IMU, aby uzyskać świeże zerowe odniesienie
+  calibrateIMU();
 }
 
-/**
- * @brief Rozbraja silniki, ustawia moc na MIN_POWER i resetuje PID.
- * Używana dla awaryjnego zatrzymania.
- */
 void disarmMotors() {
   armed = false;
-  demo_motors_active = false; // Rozbrajamy też tryb demo
+  demo_motors_active = false;
   powerChange = 0;
   currentPower = MIN_POWER;
-  setAllMotors(MIN_POWER); // Upewnij się, że silniki się zatrzymały
-  resetPID(); // Zresetuj stan PID i skalibruj IMU
-  Serial.println("SILNIKI ROZBROJONE I ZRESETOWANY PID (Awaryjne zatrzymanie)");
+  setAllMotors(MIN_POWER);
+  resetPID();
+  Serial.println(F("SILNIKI ROZBROJONE I ZRESETOWANY PID (Awaryjne zatrzymanie)"));
 }
 
-/**
- * @brief Obsługuje przychodzące polecenia Bluetooth do sterowania stanem i trybem drona.
- * @param c Znak odebrany z Bluetooth.
- */
 void handleBluetoothCommand(char c) {
-  // Awaryjne rozbrojenie działa w obu trybach
+  noInterrupts();
+  bool current_bt_state_local = bluetooth_connected_ISR;
+  interrupts();
+
   if (c == 'Q' || c == 'q') {
     disarmMotors();
-    return; // Zakończ funkcję po rozbrojeniu
+    return;
   }
 
-  if (c == 'F') { // Przełącz na Tryb Lotu
+  if (c == 'F') {
     switchMode(FLIGHT_MODE);
-  } else if (c == 'A') { // Przełącz na Tryb Demonstracji Akcelerometru
+  } else if (c == 'A') {
     switchMode(ACCEL_DEMO_MODE);
   } else if (currentOperatingMode == FLIGHT_MODE) {
-    // Przetwarzaj polecenia sterowania lotem tylko w FLIGHT_MODE
-    if (c == 'U') { // Zwiększ gaz
-      powerChange = 1;
-      // Ustawienie armed na true tylko przy pierwszym naciśnięciu 'U' lub 'D'
-      if (!armed) {
-        armed = true;
-        armTime = millis(); // Zapisz czas uzbrojenia
-        Serial.println("UZBROJONY (U)");
+    if (current_bt_state_local) {
+      if (c == 'U') {
+        powerChange = 1;
+        if (!armed) {
+          armed = true;
+          armTime = millis();
+          Serial.println(F("UZBROJONY (U)"));
+        }
+      } else if (c == 'u') {
+        powerChange = 0;
+        Serial.println(F("Moc zablokowana po zwolnieniu U"));
+      } else if (c == 'D') {
+        powerChange = -1;
+        if (!armed) {
+          armed = true;
+          armTime = millis();
+          Serial.println(F("UZBROJONY (D)"));
+        }
+      } else if (c == 'd') {
+        powerChange = 0;
+        Serial.println(F("Moc zablokowana po zwolnieniu D"));
       }
-    } else if (c == 'u') { // Przestań zwiększać gaz (lub pozwól na zmniejszanie)
-      powerChange = 0; // Zablokuj zmianę mocy, pozostawiając ją na aktualnym poziomie lub pozwalając na spadek
-      Serial.println("Moc zablokowana po zwolnieniu U");
-    } else if (c == 'D') { // Zmniejsz gaz
-      powerChange = -1;
-      // Ustawienie armed na true tylko przy pierwszym naciśnięciu 'U' lub 'D'
-      if (!armed) {
-        armed = true;
-        armTime = millis(); // Zapisz czas uzbrojenia
-        Serial.println("UZBROJONY (D)");
-      }
-    } else if (c == 'd') { // Przestań zmniejszać gaz (lub pozwól na zwiększanie)
-      powerChange = 0; // Zablokuj zmianę mocy, pozostawiając ją na aktualnym poziomie lub pozwalając na wzrost
-      Serial.println("Moc zablokowana po zwolnieniu D");
+    } else {
+      Serial.println(F("Brak połączenia Bluetooth - nie można sterować w trybie lotu."));
     }
   } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
-    // Polecenia dla trybu demonstracyjnego
     if (c == 'U' || c == 'u') {
       demo_motors_active = true;
-      Serial.println("Tryb Demo: Silniki WŁĄCZONE (przycisk U)");
+      Serial.println(F("Tryb Demo: Silniki WŁĄCZONE (przycisk U)"));
     } else if (c == 'D' || c == 'd') {
       demo_motors_active = false;
-      setAllMotors(MIN_POWER); // Upewnij się, że silniki są wyłączone natychmiast
-      Serial.println("Tryb Demo: Silniki WYŁĄCZONE (przycisk D)");
+      setAllMotors(MIN_POWER);
+      Serial.println(F("Tryb Demo: Silniki WYŁĄCZONE (przycisk D)"));
     }
   } else {
-    Serial.print("Nieznane polecenie lub polecenie nieprawidłowe w bieżącym trybie: ");
+    Serial.print(F("Nieznane polecenie lub polecenie nieprawidłowe w bieżącym trybie: "));
     Serial.println(c);
   }
 }
 
-/**
- * @brief Ustawia wszystkie silniki na określoną wartość PWM (w mikrosekundach).
- * @param pwm Wartość PWM do wysłania do wszystkich ESC.
- */
 void setAllMotors(int pwm) {
   esc1.writeMicroseconds(pwm);
   esc2.writeMicroseconds(pwm);
@@ -421,19 +390,31 @@ void setAllMotors(int pwm) {
   esc4.writeMicroseconds(pwm);
 }
 
-/**
- * @brief Przełącza tryb działania drona.
- * Resetuje odpowiednie stany podczas przełączania trybów.
- * @param newMode Tryb, na który należy się przełączyć (FLIGHT_MODE lub ACCEL_DEMO_MODE).
- */
 void switchMode(int newMode) {
   if (currentOperatingMode != newMode) {
     currentOperatingMode = newMode;
-    disarmMotors(); // Zawsze rozbrajaj podczas przełączania trybów dla bezpieczeństwa
-    Serial.print("Przełączono na ");
-    Serial.println(newMode == FLIGHT_MODE ? "FLIGHT_MODE" : "ACCEL_DEMO_MODE");
+    disarmMotors();
+    Serial.print(F("Przełączono na "));
+    Serial.println(newMode == FLIGHT_MODE ? F("FLIGHT_MODE") : F("ACCEL_DEMO_MODE"));
   } else {
-    Serial.print("Już w trybie ");
-    Serial.println(newMode == FLIGHT_MODE ? "FLIGHT_MODE" : "ACCEL_DEMO_MODE");
+    Serial.print(F("Już w trybie "));
+    Serial.println(newMode == FLIGHT_MODE ? F("FLIGHT_MODE") : F("ACCEL_DEMO_MODE"));
+  }
+}
+
+void initiateFailSafeLanding() {
+  if (currentPower > MIN_POWER) {
+    currentPower -= LANDING_POWER_DECREASE_STEP;
+    if (currentPower < MIN_POWER) {
+      currentPower = MIN_POWER;
+    }
+    setAllMotors(currentPower);
+    Serial.print(F("Ladowanie awaryjne! Moc: "));
+    Serial.println(currentPower);
+  } else {
+    if (armed) {
+      Serial.println(F("Ladowanie awaryjne zakończone - rozbrojenie silników."));
+      disarmMotors();
+    }
   }
 }
