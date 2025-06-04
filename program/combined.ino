@@ -60,6 +60,12 @@ unsigned long armTime = 0;  // Znacznik czasu uzbrojenia drona
 volatile boolean bluetooth_connected_ISR = false; // Aktualny stan połączenia Bluetooth (zmienna dla ISR)
 const int LANDING_POWER_DECREASE_STEP = 5; // Krok zmniejszania mocy podczas lądowania awaryjnego
 
+// Zmienne dla migania diody LED
+unsigned long previousMillisLED = 0;
+const long LED_BLINK_INTERVAL = 500; // Czas (w ms) na jeden cykl migania (np. 500ms włączona, 500ms wyłączona)
+bool ledState = false; // Aktualny stan diody LED (do migania)
+
+
 // Tryby Działania
 #define FLIGHT_MODE 0       // Normalny tryb lotu ze stabilizacją PID
 #define ACCEL_DEMO_MODE 1   // Tryb demonstracji akcelerometru
@@ -153,11 +159,34 @@ void loop() {
   bool current_bt_state = bluetooth_connected_ISR; // Skopiuj wartość do zmiennej lokalnej
   interrupts(); // Włącz przerwania z powrotem
 
-  // NOWA KONTROLA DIODY LED: Świeci tylko w trybie FLIGHT_MODE
-  digitalWrite(LED_PIN, currentOperatingMode == FLIGHT_MODE ? HIGH : LOW);
+  // KONTROLA DIODY LED:
+  // - Tryb Lotu i BT połączone: Dioda świeci ciągle
+  // - Tryb Lotu i BT rozłączone: Dioda miga
+  // - Tryb Demonstracji Akcelerometru: Dioda wyłączona
+  if (currentOperatingMode == FLIGHT_MODE) {
+    if (current_bt_state) {
+      // Tryb Lotu i BT połączone: Dioda świeci ciągle
+      digitalWrite(LED_PIN, HIGH);
+    } else {
+      // Tryb Lotu i BT rozłączone: Dioda miga
+      unsigned long currentMillis = millis();
+      if (currentMillis - previousMillisLED >= LED_BLINK_INTERVAL) {
+        previousMillisLED = currentMillis;
+        ledState = !ledState; // Zmień stan diody (przełącz na przeciwny)
+        digitalWrite(LED_PIN, ledState);
+      }
+    }
+  } else {
+    // Tryb Demonstracji Akcelerometru: Dioda wyłączona
+    digitalWrite(LED_PIN, LOW);
+  }
 
-  // Jeśli połączenie Bluetooth zostało utracone, zainicjuj bezpieczne lądowanie
-  if (currentOperatingMode == FLIGHT_MODE && armed && !current_bt_state) {
+  // ZMIENIONY WARUNEK: Jeśli połączenie Bluetooth zostało utracone
+  // ORAZ jesteśmy w FLIGHT_MODE z uzbrojonymi silnikami
+  // LUB jesteśmy w ACCEL_DEMO_MODE z aktywnymi silnikami demo
+  if (!current_bt_state && 
+      ((currentOperatingMode == FLIGHT_MODE && armed) || 
+       (currentOperatingMode == ACCEL_DEMO_MODE && demo_motors_active))) {
     initiateFailSafeLanding();
   }
   
@@ -183,7 +212,9 @@ void loop() {
     rollCorrection = computePIDRoll(roll, dt);
     pitchCorrection = computePIDPitch(pitch, dt);
   } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
-    currentPower = DEMO_BASE_POWER; // W trybie demo moc bazowa jest stała
+    // W trybie demo moc bazowa jest stała (lub zmniejszana w awaryjnym lądowaniu)
+    // Brak bezpośredniego zwiększania/zmniejszania mocy przez powerChange
+    // demo_motors_active jest ustawiane przez 'U'/'D' w handleBluetoothCommand
   } else {
     // Jeśli nie jesteśmy w trybie lotu i uzbrojeni, lub nie jesteśmy połączeni,
     // silniki powinny być na minimum (albo w stanie lądowania awaryjnego)
@@ -206,6 +237,7 @@ void loop() {
     Serial.print(F(", BT Connected: ")); Serial.println(current_bt_state ? F("TAK") : F("NIE"));
   } else { // ACCEL_DEMO_MODE
     Serial.print(F(", Demo Active: ")); Serial.print(demo_motors_active ? F("TAK") : F("NIE"));
+    Serial.print(F(", Current Power: ")); Serial.print(currentPower); // Dodano, aby widzieć zmianę mocy w demo_mode
     Serial.print(F(", ESC1:")); Serial.print(esc1.readMicroseconds());
     Serial.print(F(", ESC2:")); Serial.print(esc2.readMicroseconds());
     Serial.print(F(", ESC3:")); Serial.print(esc3.readMicroseconds());
@@ -290,13 +322,19 @@ void applyMotorPower(int rollCorr, int pitchCorr) {
     }
   } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
     if (demo_motors_active) {
+      // W trybie demo, currentPower jest używane tylko do lądowania awaryjnego.
+      // Normalnie moc bazowa to DEMO_BASE_POWER.
+      // Jeśli lądowanie awaryjne jest aktywne, currentPower będzie spadać.
+      int basePwr = (currentPower == MIN_POWER && demo_motors_active) ? DEMO_BASE_POWER : currentPower;
+      if (basePwr < MIN_POWER) basePwr = MIN_POWER; // Zabezpieczenie przed ujemną mocą
+
       int demoRollCorrection = (int)(DEMO_KP_ROLL * roll);
       int demoPitchCorrection = (int)(DEMO_KP_PITCH * pitch);
 
-      int power1 = constrain(DEMO_BASE_POWER + demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
-      int power2 = constrain(DEMO_BASE_POWER - demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
-      int power3 = constrain(DEMO_BASE_POWER + demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
-      int power4 = constrain(DEMO_BASE_POWER - demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
+      int power1 = constrain(basePwr + demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
+      int power2 = constrain(basePwr - demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
+      int power3 = constrain(basePwr + demoRollCorrection - demoPitchCorrection, MIN_POWER, MAX_POWER);
+      int power4 = constrain(basePwr - demoRollCorrection + demoPitchCorrection, MIN_POWER, MAX_POWER);
 
       esc1.writeMicroseconds(power1);
       esc2.writeMicroseconds(power2);
@@ -322,7 +360,7 @@ void disarmMotors() {
   armed = false;
   demo_motors_active = false;
   powerChange = 0;
-  currentPower = MIN_POWER;
+  currentPower = MIN_POWER; // Zawsze ustaw na MIN_POWER po rozbrojeniu
   setAllMotors(MIN_POWER);
   resetPID();
   Serial.println(F("SILNIKI ROZBROJONE I ZRESETOWANY PID (Awaryjne zatrzymanie)"));
@@ -369,13 +407,19 @@ void handleBluetoothCommand(char c) {
       Serial.println(F("Brak połączenia Bluetooth - nie można sterować w trybie lotu."));
     }
   } else if (currentOperatingMode == ACCEL_DEMO_MODE) {
-    if (c == 'U' || c == 'u') {
-      demo_motors_active = true;
-      Serial.println(F("Tryb Demo: Silniki WŁĄCZONE (przycisk U)"));
-    } else if (c == 'D' || c == 'd') {
-      demo_motors_active = false;
-      setAllMotors(MIN_POWER);
-      Serial.println(F("Tryb Demo: Silniki WYŁĄCZONE (przycisk D)"));
+    if (current_bt_state_local) { // Dodano sprawdzenie połączenia Bluetooth w DEMO_MODE
+      if (c == 'U' || c == 'u') {
+        demo_motors_active = true;
+        currentPower = DEMO_BASE_POWER; // Ustaw moc bazową po włączeniu silników w demo
+        Serial.println(F("Tryb Demo: Silniki WŁĄCZONE (przycisk U)"));
+      } else if (c == 'D' || c == 'd') {
+        demo_motors_active = false;
+        setAllMotors(MIN_POWER);
+        currentPower = MIN_POWER; // Zresetuj moc po wyłączeniu silników w demo
+        Serial.println(F("Tryb Demo: Silniki WYŁĄCZONE (przycisk D)"));
+      }
+    } else {
+      Serial.println(F("Brak połączenia Bluetooth - nie można sterować w trybie demo."));
     }
   } else {
     Serial.print(F("Nieznane polecenie lub polecenie nieprawidłowe w bieżącym trybie: "));
@@ -412,7 +456,8 @@ void initiateFailSafeLanding() {
     Serial.print(F("Ladowanie awaryjne! Moc: "));
     Serial.println(currentPower);
   } else {
-    if (armed) {
+    // Jeśli już osiągnięto MIN_POWER i silniki były aktywne, rozbrój je.
+    if (armed || demo_motors_active) {
       Serial.println(F("Ladowanie awaryjne zakończone - rozbrojenie silników."));
       disarmMotors();
     }
